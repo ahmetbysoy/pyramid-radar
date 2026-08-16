@@ -50,6 +50,8 @@ export class BinanceFuturesAdapter {
   private backoffMs = 1000;
   /** visibility değişince durdur/devam et */
   private visibilityHandler: (() => void) | null = null;
+  private onlineHandler: (() => void) | null = null;
+  private offlineHandler: (() => void) | null = null;
 
   constructor(symbols: string[], handlers: Handlers) {
     this.symbols = symbols.map((s) => s.toLowerCase());
@@ -65,7 +67,6 @@ export class BinanceFuturesAdapter {
     if (typeof document !== 'undefined' && !this.visibilityHandler) {
       this.visibilityHandler = () => {
         if (document.hidden) {
-          // Arka plan: sadece bağlantıyı kapat, reconnect'i temizle, durumu connecting yap
           this._clearTimeouts();
           this._close(this.publicWs);
           this._close(this.marketWs);
@@ -75,13 +76,30 @@ export class BinanceFuturesAdapter {
           this.marketReady = false;
           this.handlers.onStatus('connecting');
         } else {
-          // Ön plana dön: hemen yeniden bağlan
           this.backoffMs = 1000;
           this._connectPublic();
           this._connectMarket();
         }
       };
       document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
+
+    // Online/offline takibi
+    if (typeof window !== 'undefined' && !this.onlineHandler) {
+      this.offlineHandler = () => this.handlers.onStatus('offline');
+      this.onlineHandler = () => {
+        this.handlers.onStatus('reconnecting');
+        this.backoffMs = 1000;
+        this._clearTimeouts();
+        this._close(this.publicWs);
+        this._close(this.marketWs);
+        this.publicWs = null;
+        this.marketWs = null;
+        this._connectPublic();
+        this._connectMarket();
+      };
+      window.addEventListener('offline', this.offlineHandler);
+      window.addEventListener('online', this.onlineHandler);
     }
   }
 
@@ -95,6 +113,12 @@ export class BinanceFuturesAdapter {
     if (this.visibilityHandler && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.visibilityHandler);
       this.visibilityHandler = null;
+    }
+    if (this.onlineHandler && typeof window !== 'undefined') {
+      window.removeEventListener('online', this.onlineHandler);
+      window.removeEventListener('offline', this.offlineHandler!);
+      this.onlineHandler = null;
+      this.offlineHandler = null;
     }
   }
 

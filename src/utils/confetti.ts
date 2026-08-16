@@ -70,8 +70,13 @@ function loop(): void {
   }
   if (alive === 0) {
     running = false;
-    if (canvas) {
+    if (canvas && canvas.parentNode) {
       ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      // Canvas'ı DOM'dan kaldır (boşuna yer tutmasın)
+      canvas.remove();
+      canvas = null;
+      ctx = null;
+      particles = [];
     }
     cancelAnimationFrame(raf);
     return;

@@ -27,7 +27,7 @@ export function isSoundEnabled(): boolean {
   return enabled;
 }
 
-function tone(freq: number, durationMs: number, type: OscillatorType = 'sine', gain = 0.12, freqEnd?: number): void {
+export function tone(freq: number, durationMs: number, type: OscillatorType = 'sine', gain = 0.12, freqEnd?: number): void {
   const ac = getCtx();
   if (!ac) return;
   const osc = ac.createOscillator();
@@ -45,8 +45,9 @@ function tone(freq: number, durationMs: number, type: OscillatorType = 'sine', g
   osc.stop(ac.currentTime + durationMs / 1000 + 0.02);
 }
 
-/** Küçük mikro ticaret tıkırtısı */
+/** Küçük mikro ticaret tıkırtısı. tierIdx < 0 → sessiz */
 export function playTick(side: 'BUY' | 'SELL', tierIdx = 0): void {
+  if (tierIdx < 0) return;
   const base = side === 'BUY' ? 600 : 440;
   const freq = base + tierIdx * 60;
   tone(freq, 60, 'square', 0.04);

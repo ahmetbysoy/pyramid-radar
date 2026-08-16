@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { fetchExchangeInfo, getMeta } from '../utils/exchangeInfo';
 import { formatPrice, formatPct, formatCompact } from '../utils/format';
 import { BinanceFuturesAdapter } from '../core/ws/BinanceFuturesAdapter';
@@ -7,7 +7,7 @@ import { TIERS } from '../core/tiers';
 import { PyramidVisual } from '../ui/components/PyramidVisual';
 import { usePyramidManager } from './usePyramidManager';
 import { useStore, SYMBOL } from '../store';
-import { setSoundEnabled, playTick } from '../utils/sound';
+import { setSoundEnabled, playTick, tone } from '../utils/sound';
 import type { Trade, Depth, MarkPrice, WsStatus, SymbolMeta } from '../types';
 import '../styles/global.css';
 
@@ -69,11 +69,10 @@ export function App() {
     adapter.connect();
 
     // 10 Hz render döngüsü
+    let lastRafScore = 0;
     const tick = () => {
       const s = engine.compute(Date.now());
       setSnap(s);
-      scoreRef.current = s.confidence * (s.signal.startsWith('BUY') ? 1 : s.signal.startsWith('SELL') ? -1 : 0);
-      // sign değerini confidence'a göre düzelt
       const signedScore = (() => {
         if (s.signal === 'STRONG_BUY') return s.confidence;
         if (s.signal === 'BUY') return Math.max(20, s.confidence * 0.6);
@@ -82,7 +81,11 @@ export function App() {
         return 0;
       })();
       scoreRef.current = signedScore;
-      setScore(SYMBOL, signedScore);
+      // sadece skor anlamlı değiştiyse store'a yaz (gereksiz re-render önle)
+      if (Math.abs(signedScore - lastRafScore) > 5) {
+        setScore(SYMBOL, signedScore);
+        lastRafScore = signedScore;
+      }
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -123,17 +126,46 @@ export function App() {
   const r = regimeLabel[regime] ?? regimeLabel.QUIET;
   const lastWreck = wreckedPyramids[wreckedPyramids.length - 1];
 
-  const toggleSound = () => {
+  const toggleSound = useCallback(() => {
     const next = !soundOn;
     setSoundOn(next);
     setSoundEnabled(next);
-  };
+  }, [soundOn]);
   useEffect(() => { setSoundEnabled(soundOn); }, [soundOn]);
+
+  // İlk kullanıcı hareketinde ses context'ini unlock et (iOS Safari gerektirir)
+  useEffect(() => {
+    const unlock = () => {
+      // Sessiz bir tık ile context'i aktif et (duyulmayacak kadar düşük ses)
+      tone(800, 1, 'sine', 0.001);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    window.addEventListener('touchstart', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('touchstart', unlock);
+    };
+  }, []);
 
   // Emir defteri görseli
   const depthView = lastDepthRef.current;
-  const topAsks = useMemo(() => (depthView ? [...depthView.asks.slice(0, 8)].reverse() : []), [depthView?.bids.length, depthView?.asks.length, depthView?.maxQty]);
-  const topBids = useMemo(() => (depthView ? depthView.bids.slice(0, 8) : []), [depthView?.bids.length, depthView?.asks.length, depthView?.maxQty]);
+  const depthVersion = useRef(0);
+  const [depthTick, setDepthTick] = useState(0);
+
+  // her ~100ms'de bir order book render et (10Hz çok hızlı, 100ms daha akıcı + daha az render)
+  useEffect(() => {
+    const id = setInterval(() => {
+      depthVersion.current++;
+      setDepthTick(depthVersion.current);
+    }, 150);
+    return () => clearInterval(id);
+  }, []);
+  void depthTick;
+
+  const topAsks = useMemo(() => (depthView ? [...depthView.asks.slice(0, 8)].reverse() : []), [depthView?.maxQty, depthTick]);
+  const topBids = useMemo(() => (depthView ? depthView.bids.slice(0, 8) : []), [depthView?.maxQty, depthTick]);
 
   return (
     <div className="app app--full">
@@ -141,7 +173,7 @@ export function App() {
       <header className="hdr">
         <div className="hdr-left">
           <span className={`status-dot ${status}`} />
-          <span className="hdr-sym">BTC/USDT PERP</span>
+          <span className="hdr-sym">BTC/USDT PERP{status === 'offline' ? ' · ÇEVRİMDIŞI' : status === 'reconnecting' ? ' · YENİDEN BAĞLANIYOR' : ''}</span>
         </div>
         <div className="hdr-center">
           <div className={`price-big ${priceChange >= 0 ? 'up' : 'down'}`}>
@@ -217,8 +249,14 @@ export function App() {
                   </div>
                   <div className="tier-bar-wrap">
                     <div className="tier-bar">
-                      <div className="tier-buy" style={{ width: `${buyPct}%` }} />
-                      <div className="tier-sell" style={{ width: `${100 - buyPct}%` }} />
+                      {active ? (
+                        <>
+                          <div className="tier-buy" style={{ width: `${buyPct}%` }} />
+                          <div className="tier-sell" style={{ width: `${100 - buyPct}%` }} />
+                        </>
+                      ) : (
+                        <div className="tier-empty" />
+                      )}
                     </div>
                     {active && Math.abs(imb) > 0.15 && (
                       <div className={`tier-arrow ${imb > 0 ? 'up' : 'down'}`}>
