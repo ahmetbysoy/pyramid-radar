@@ -5,16 +5,20 @@
  * dağılımını kullanarak tier eşiklerini otomatik belirler.
  * BTC'de mega = 1M+$ iken PEPE'de 1K+$ olabilir, sistem her coin'e kendi uyum sağlar.
  *
- * Percentile dilimleri (kümülatif):
- *   MICRO  : P0–P20   (en küçük %20 işlem) — sıfır hisseden perakende
- *   SMALL  : P20–P45  (sonraki %25)        — ufak trader
- *   MEDIUM : P45–P70  (sonraki %25)        — düzgün perakende
- *   LARGE  : P70–P90  (sonraki %20)        — akıllı para / ufak balina
- *   WHALE  : P90–P99  (son %9)             — balina
- *   MEGA   : P99+     (en tepedeki %1)     — mega balina / kurumsal
+ * ÖNEMLİ: Percentile kendi kendini köreltmesin diye taban/tavan eklendi:
+ *  - Percentile çok küçük bir coin'de anlamsız küçük kalmaması için MUTLAK MINIMUM:
+ *      SMALL ≥ 50$, LARGE ≥ 1000$, WHALE ≥ 10_000$, MEGA ≥ 50_000$
+ *  - Çok uç/balinalı dönemlerde WHALE/MEGA aşırı şişmesin diye MUTLAK TAVAN:
+ *      WHALE ≤ 2M$, MEGA ≤ 20M$
+ *  - EMA yumuşatması ile eşikler zıplamasın
  *
- * Hesaplama yaklaşımı: son MAX_SAMPLES adet trade'in notional değerini ring buffer'da tut,
- * 2 saniyede bir sıralayarak yaklaşık percentille'i çıkar. Hafıza/CPU dostu.
+ * Percentile dilimleri (kümülatif):
+ *   MICRO  : P0–P20   (en küçük %20)
+ *   SMALL  : P20–P45
+ *   MEDIUM : P45–P70
+ *   LARGE  : P70–P90  — akıllı para
+ *   WHALE  : P90–P99  — balina
+ *   MEGA   : P99+     — mega balina
  */
 
 import type { TierId } from './tiers';
@@ -59,11 +63,28 @@ const PERCENTILES: Record<TierId, number> = {
   MEGA: 99,
 };
 
-const MAX_SAMPLES = 3000;      // son ~3000 işlem (15dk'da BTC için rahat yeter)
-const RECALC_MS = 2000;       // 2 saniyede bir percentille'i yeniden hesapla
-const MIN_SAMPLES = 30;       // en az bu kadar işlem birikmeden adaptife geçme
+const MAX_SAMPLES = 3000;
+const RECALC_MS = 2000;
+const MIN_SAMPLES = 30;
+const EMA_ALPHA = 0.15;    // eşik yumuşatması — ani kaymaları önler
 
-/** Başlangıç için mantıklı varsayılan eşikler (BTC benzeri) */
+// Mutlak tabanlar (kendi kendini köreltmeyi engeller)
+const FLOOR = {
+  SMALL: 50,
+  MEDIUM: 500,
+  LARGE: 1_000,
+  WHALE: 10_000,
+  MEGA: 50_000,
+};
+// Mutlak tavanlar (mega balina dönemlerinde aşırı şişmeyi engeller)
+const CEIL = {
+  SMALL: 10_000,
+  MEDIUM: 100_000,
+  LARGE: 500_000,
+  WHALE: 2_000_000,
+  MEGA: 20_000_000,
+};
+
 const FALLBACK_THRESHOLDS: TierThresholds = {
   MICRO: 0,
   SMALL: 100,
@@ -126,15 +147,15 @@ export class AdaptiveTierTracker {
   }
 
   private recalc(): void {
+    const now = Date.now();
     if (this.samples.length < MIN_SAMPLES) {
-      this.thresholds = { ...FALLBACK_THRESHOLDS, sampleSize: this.samples.length, updatedAt: Date.now() };
+      this.thresholds = { ...FALLBACK_THRESHOLDS, sampleSize: this.samples.length, updatedAt: now };
       return;
     }
-    // Kopyasını alıp sırala
     const sorted = [...this.samples].sort((a, b) => a - b);
     const n = sorted.length;
 
-    const pct = (p: number): number => {
+    const rawPct = (p: number): number => {
       if (n === 0) return 0;
       const rank = (p / 100) * (n - 1);
       const lo = Math.floor(rank);
@@ -143,14 +164,46 @@ export class AdaptiveTierTracker {
       return sorted[lo] * (1 - frac) + sorted[hi] * frac;
     };
 
+    // Ham percentile değerleri
+    const raw = {
+      SMALL: rawPct(PERCENTILES.SMALL),
+      MEDIUM: rawPct(PERCENTILES.MEDIUM),
+      LARGE: rawPct(PERCENTILES.LARGE),
+      WHALE: rawPct(PERCENTILES.WHALE),
+      MEGA: rawPct(PERCENTILES.MEGA),
+    };
+    // Tabana/tavana kelepçele
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    const clamped = {
+      SMALL:  clamp(raw.SMALL,  FLOOR.SMALL,  CEIL.SMALL),
+      MEDIUM: clamp(raw.MEDIUM, FLOOR.MEDIUM, CEIL.MEDIUM),
+      LARGE:  clamp(raw.LARGE,  FLOOR.LARGE,  CEIL.LARGE),
+      WHALE:  clamp(raw.WHALE,  FLOOR.WHALE,  CEIL.WHALE),
+      MEGA:   clamp(raw.MEGA,   FLOOR.MEGA,   CEIL.MEGA),
+    };
+    // Monotonluk garantisi: her tier bir öncekinden ≥%20 büyük olsun
+    if (clamped.MEDIUM < clamped.SMALL * 1.2)  clamped.MEDIUM = clamped.SMALL * 1.2;
+    if (clamped.LARGE  < clamped.MEDIUM * 1.2) clamped.LARGE  = clamped.MEDIUM * 1.2;
+    if (clamped.WHALE  < clamped.LARGE * 1.2)  clamped.WHALE  = clamped.LARGE * 1.2;
+    if (clamped.MEGA   < clamped.WHALE * 1.5)  clamped.MEGA   = clamped.WHALE * 1.5;
+    // Tavanı tekrar uygula (monotonluk sonrası aşmış olabilir)
+    clamped.MEDIUM = Math.min(clamped.MEDIUM, CEIL.MEDIUM);
+    clamped.LARGE  = Math.min(clamped.LARGE,  CEIL.LARGE);
+    clamped.WHALE  = Math.min(clamped.WHALE,  CEIL.WHALE);
+    clamped.MEGA   = Math.min(clamped.MEGA,   CEIL.MEGA);
+
+    // EMA yumuşatması (eşikler her 2sn'de bir α kadar yeni değere yaklaşsın)
+    const ema = (prev: number, next: number) =>
+      prev > 0 ? prev * (1 - EMA_ALPHA) + next * EMA_ALPHA : next;
+
     this.thresholds = {
       MICRO: 0,
-      SMALL: pct(PERCENTILES.SMALL),
-      MEDIUM: pct(PERCENTILES.MEDIUM),
-      LARGE: pct(PERCENTILES.LARGE),
-      WHALE: pct(PERCENTILES.WHALE),
-      MEGA: pct(PERCENTILES.MEGA),
-      updatedAt: Date.now(),
+      SMALL:  ema(this.thresholds.SMALL,  clamped.SMALL),
+      MEDIUM: ema(this.thresholds.MEDIUM, clamped.MEDIUM),
+      LARGE:  ema(this.thresholds.LARGE,  clamped.LARGE),
+      WHALE:  ema(this.thresholds.WHALE,  clamped.WHALE),
+      MEGA:   ema(this.thresholds.MEGA,   clamped.MEGA),
+      updatedAt: now,
       sampleSize: this.filled ? MAX_SAMPLES : n,
     };
   }

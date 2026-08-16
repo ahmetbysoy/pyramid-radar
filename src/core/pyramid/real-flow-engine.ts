@@ -184,15 +184,19 @@ export function updateRealPyramid(
   void oppSideFills; // karşı taraf dolgusu katman dolgusuna eklenmez, VWAP'ı etkilemez.
   // (Ancak fiyat üzerinden katman invalidate olur.)
 
+  // ── 2. Flow hizalamasi ────────────────────────────────
+  const flowAligned =
+    (p.side === 'BUY' && flowSide > 0.3) ||
+    (p.side === 'SELL' && flowSide < -0.3);
+
+  // ── 1. Gelen dolgulari son katmana ekle ─────────────────
   if (p.layers.length > 0 && sameSideFills.length > 0) {
     const top = p.layers[p.layers.length - 1];
     for (const f of sameSideFills) {
-      // Sadece "akıllı para" seviyesi üstündeki dolgular piramidi besler.
-      // (Retail dolgusu katman büyüklüğüne katkı yapmaz — bu balina takibi.)
       if (f.tier === 'MICRO' || f.tier === 'SMALL' || f.tier === 'MEDIUM') continue;
       top.notional += f.notional;
       top.qtyBase += f.qty;
-      top.vwap = top.notional / top.qtyBase;
+      top.vwap = top.qtyBase > 0 ? top.notional / top.qtyBase : top.vwap;
       top.lastFillTs = ts;
       p.totalNotional += f.notional;
       p.totalQtyBase += f.qty;
@@ -200,53 +204,62 @@ export function updateRealPyramid(
       p.peakNotional = Math.max(p.peakNotional, p.totalNotional);
       events.push({ type: 'LAYER_FILLED', pyramid: p, level: top.level, tier: f.tier, addedNotional: f.notional });
     }
-    // Son dolgu invalidatePrice'ı da VWAP'a göre güncelle
     top.invalidatePrice = invalidatePriceForLayer(top.vwap, p.side, cfg.layerRemovePct);
   }
 
-  // ── 2. Yeni katman açma ────────────────────────────────
-  const flowAligned =
-    (p.side === 'BUY' && flowSide > 0.3) ||
-    (p.side === 'SELL' && flowSide < -0.3);
-
-  // Katman ekleme eşiği: min 5K$ veya ilk katmanın %10'u
+  // ── 3. Yeni katman açma ────────────────────────────────
+  // Yeni katman addThreshold kadar tohum notional ile açılır — 0-notional hayalet yok.
+  const top = p.layers[p.layers.length - 1];
   const baseNotional = p.layers[0]?.notional ?? MIN_TIER_NOTIONAL;
-  const addThreshold = Math.max(MIN_TIER_NOTIONAL, baseNotional * 0.1);
+  const referenceNotional = top?.notional ?? baseNotional;
+  const addThreshold = Math.max(MIN_TIER_NOTIONAL, referenceNotional * 0.1);
 
-  // Pending dolgu çok uzun süre beklediyse sıfırla
-  if (p.pendingNotional > 0 && ts - (p.layers[p.layers.length - 1]?.lastFillTs ?? p.entryTs) > PENDING_KICK) {
+  if (p.pendingNotional > 0 && ts - (top?.lastFillTs ?? p.entryTs) > PENDING_KICK) {
     p.pendingNotional = 0;
   }
 
-  if (flowAligned && p.pendingNotional >= addThreshold) {
+  if (flowAligned && p.pendingNotional >= addThreshold && top) {
     while (true) {
       const hitThreshold =
         p.side === 'BUY' ? lastPrice >= p.nextLayerPrice : lastPrice <= p.nextLayerPrice;
       if (!hitThreshold) break;
 
       const newLevel = p.layers.length + 1;
-      // En son gelen akıllı para dolgusunun dominant tier'ını al
-      const topFill = sameSideFills[sameSideFills.length - 1];
-      const dominantTier: TierId = topFill?.tier ?? 'LARGE';
+      const dominantTier: TierId =
+        sameSideFills[sameSideFills.length - 1]?.tier ?? 'LARGE';
+
+      // Yeni katman: anchor olarak lastPrice kullan, başlangıç notional'ı 0.
+      // Pending sadece eşik sayacıydı, içindeki dolgu zaten eski katmanda sayıldı —
+      // double-count yapmamak için sıfırdan başlarız.
+      // Pending dolgu yeni katmanın tohumudur — double-count olmaması için
+      // eski katmandan düşeriz (pending eski katmanda "birikmiş" sayılıyordu).
+      // Ancak pendingNotional eski dolguların ÜSTÜNE eklenen sayacı tuttuğundan
+      // aslında double-count yok, çünkü pending her zaman 0'dan sayacağa resetlenir.
+      // Yeni katman min addThreshold kadar tohumla açılır:
+      const seedNotional = addThreshold;
+      const seedQty = seedNotional / lastPrice;
       const newLayer: RealLayer = {
         level: newLevel,
         dominantTier,
         anchorPrice: lastPrice,
         vwap: lastPrice,
-        notional: 0, // gerçek dolgu geldikçe şişecek
-        qtyBase: 0,
+        notional: seedNotional,
+        qtyBase: seedQty,
         addTs: ts,
         lastFillTs: ts,
         invalidatePrice: invalidatePriceForLayer(lastPrice, p.side, cfg.layerRemovePct),
       };
       p.layers.push(newLayer);
+      p.totalNotional += seedNotional;
+      p.totalQtyBase += seedQty;
       p.peakLayers = Math.max(p.peakLayers, newLevel);
       p.lastGrowthTs = ts;
       p.nextLayerPrice = nextLayerPrice(lastPrice, p.side, cfg.layerAddPct);
       p.pendingNotional = 0;
       p.status = 'GROWING';
+      p.peakNotional = Math.max(p.peakNotional, p.totalNotional);
       events.push({ type: 'LAYER_ADDED', pyramid: p, level: newLevel, tier: dominantTier });
-      if (newLevel > 50) break; // sonsuz döngü koruması
+      if (newLevel > 50) break;
     }
   }
 

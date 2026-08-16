@@ -220,10 +220,6 @@ export class BucketStore {
             retB += b.tierBuy[tid]; retS += b.tierSell[tid];
           }
         }
-        if (firstPrice === 0 || b.sec < Math.floor(firstPrice / 1)) {
-          // en eski bucket = ilk fiyat → loop tersten gidiyor,
-          // son gördüğümüz (en eski) open'ı firstPrice yap
-        }
         if (i === 0) lastPrice = b.c; // en yeni close
         if (!highPrice || b.h > highPrice) highPrice = b.h;
         if (!lowPrice || b.l < lowPrice) lowPrice = b.l;

@@ -163,13 +163,52 @@ export class EngineKernel {
 
   connect() {
     this.destroyed = false;
+    // NOT: reset() CAGRILMAZ — session/buckets/piramitler korunur.
+    // Gorunurluk degisince sadece WS baglantisi durdurup tekrar acariz (pause/resume).
+    this.connectPublic();
+    this.connectMarket();
+    // Ic hesap tick'i 1Hz
+    if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
+    this.tickTimer = window.setInterval(() => this.internalTick(Date.now()), 1000);
+  }
+
+  /** Sadece WS baglantisini kapat, state'i koru. Arka planda veri akisi dursun. */
+  pause() {
+    if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.closeWs(this.publicWs); this.publicWs = null;
+    this.closeWs(this.marketWs); this.marketWs = null;
+    this.publicReady = false; this.marketReady = false;
+    this.status = 'idle';
+  }
+
+  /** WS baglantisini yeniden ac (state korunur, sifirdan baslamaz). */
+  resume() {
+    if (this.destroyed) return;
+    this.backoffMs = 1000;
+    this.connectPublic();
+    this.connectMarket();
+    if (!this.tickTimer) {
+      this.tickTimer = window.setInterval(() => this.internalTick(Date.now()), 1000);
+    }
+  }
+
+  /** Tamamen sifirla (kullanici coin degistirirse ya da manuel reset). */
+  hardReset() {
     this.buckets.reset();
     this.pyramids = [];
     this.wreckedCount = 0;
-    this.connectPublic();
-    this.connectMarket();
-    // Ic hesap tick'i 1Hz — asagida snapshot 60fps, ama hesaplar saniyede bir yeter
-    this.tickTimer = window.setInterval(() => this.internalTick(Date.now()), 1000);
+    this.lastWreckReason = null;
+    this.lastWreckAt = 0;
+    this.pendingSmartFills = [];
+    this.price = 0;
+    this.prevPrice = 0;
+    this.priceDir = 'same';
+    this.lastTradeTs = 0;
+    this.lastDepth = null;
+    this.lastComputeResult = null;
+    this.lastSnapshot = null;
+    this.lastSnapshotTs = 0;
   }
 
   disconnect() {
@@ -406,7 +445,7 @@ export class EngineKernel {
     let score = short.smartImb * 50 + long.smartImb * 30 + short.recentImb * 20;
     if (regime === 'ACCUMULATION') score += 25;
     if (regime === 'DISTRIBUTION') score -= 25;
-    if (false || divergence.type === 'RETAIL_CHOP') score *= 0.4;
+    if (divergence.type === 'RETAIL_CHOP') score *= 0.4;
     if (short.totalVol < 500_000) score *= 0.5;
     score = Math.max(-100, Math.min(100, score));
 

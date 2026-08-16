@@ -66,10 +66,10 @@ export function App() {
     };
     rafRef.current = requestAnimationFrame(tick);
 
-    // Visibility
+    // Visibility: pause/resume (HARD RESET YOK — bucket/session/piramit korunur)
     const onVis = () => {
-      if (document.hidden) kernel.disconnect();
-      else { kernel.backoffMs = 1000; kernel.connect(); }
+      if (document.hidden) kernel.pause();
+      else kernel.resume();
     };
     document.addEventListener('visibilitychange', onVis);
 
