@@ -3,9 +3,17 @@ import type { Depth, MarkPrice, Trade, WsStatus } from '../../types';
 /**
  * Binance USDⓈ-M Futures WebSocket adapter'ı.
  *
- * Yeni routing (2026):
- *   - Public (yüksek frekans depth): wss://fstream.binance.com/public/ws
- *   - Market  (aggTrade, markPrice): wss://fstream.binance.com/market/ws
+ * ⚠️ KRİTİK DEĞİŞİKLİK (2026):
+ * Eski `wss://fstream.binance.com/ws` ve `/stream` adresleri
+ * 23 Nisan 2026'da KAPANDI. İnternetteki tutorial'ların %99'u
+ * hala eski adresleri kullanıyor, çalışmazlar!
+ *
+ * Yeni routing (kategorize edilmiş) endpoint'ler:
+ *   - Public (yüksek frekans depth):  wss://fstream.binance.com/public/ws
+ *   - Market  (aggTrade, markPrice):  wss://fstream.binance.com/market/ws
+ *   - Private (user data):             wss://fstream.binance.com/private/ws
+ *
+ * Kaynak: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
  */
 
 const PUBLIC_URL = 'wss://fstream.binance.com/public/ws';
