@@ -692,3 +692,192 @@ html, body, #root {
   .win-session { display: none; }
   .div-val { font-size: 0.9rem; }
 }
+
+/* ─── COMPASS / PRESSURE ─────────────── */
+.compass-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 14px;
+  align-items: center;
+}
+.compass-wrap {
+  position: relative;
+  width: 110px;
+  height: 110px;
+  flex-shrink: 0;
+}
+.compass-wrap canvas { width: 110px; height: 110px; }
+.compass-info { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.compass-row {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  gap: 8px;
+}
+.compass-row span:first-child { color: var(--muted); }
+.compass-row span:last-child { font-weight: 700; }
+
+.pressure-gauge {
+  height: 10px;
+  background: var(--surface-2);
+  border-radius: 5px;
+  position: relative;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.pressure-fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  transition: width 0.3s ease, background 0.3s;
+  border-radius: 5px;
+}
+.pressure-mid {
+  position: absolute;
+  left: 50%;
+  top: -2px; bottom: -2px;
+  width: 2px;
+  background: rgba(124,141,176,.4);
+}
+.pressure-thresh {
+  position: absolute;
+  top: -4px; bottom: -4px;
+  width: 2px;
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
+/* ─── VWAP BANDS ─────────────────────── */
+.vwap-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.vwap-strip {
+  position: relative;
+  height: 48px;
+  margin-top: 8px;
+  background: var(--surface-2);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.vwap-line {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 1px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  pointer-events: none;
+  transition: left 0.5s ease;
+}
+.vwap-line::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: currentColor;
+  opacity: 0.7;
+}
+.vwap-price-marker {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 3px;
+  background: var(--text);
+  box-shadow: 0 0 10px currentColor;
+  transition: left 0.3s ease;
+  z-index: 5;
+}
+.vwap-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(0,0,0,0.7);
+  z-index: 2;
+  white-space: nowrap;
+}
+
+/* ─── ADAPTIVE THRESHOLDS ────────────── */
+.thresh-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  margin-top: 8px;
+}
+.thresh-pill {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 2px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+}
+.thresh-pill .thresh-emoji { font-size: 0.9rem; display: block; }
+.thresh-pill .thresh-name { color: var(--muted); font-size: 0.55rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.thresh-pill .thresh-val { color: var(--text); font-weight: 700; display: block; margin-top: 2px; font-size: 0.7rem; }
+.thresh-pill.thresh-smart { border-color: var(--green); }
+
+/* ─── REGIME FLASH ───────────────────── */
+@keyframes regimeFlash {
+  0% { box-shadow: 0 0 0 0 var(--flash-color, rgba(248,113,113,0.7)); }
+  100% { box-shadow: 0 0 0 20px transparent; }
+}
+.regime-flash { animation: regimeFlash 0.8s ease-out; }
+
+/* ─── WRECK SHAKE + DISSOLVE ────────── */
+@keyframes wreckPulse {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.98); }
+  100% { opacity: 0; transform: scale(0.9); }
+}
+.pyr-stack.pyr-status--wrecked {
+  animation: wreckPulse 1.5s ease-out forwards;
+  border-color: var(--red);
+}
+
+/* ─── SAVAŞ PANELİ (ÇOKLU PİRAMİT) ──── */
+.battle-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--amber);
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(251,191,36,0.1);
+  border: 1px solid rgba(251,191,36,0.3);
+  animation: pulse 1.5s infinite;
+}
+
+.pyr-side-title {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 6px;
+  margin-bottom: 2px;
+}
+.pyr-side-title.buy { color: var(--green); }
+.pyr-side-title.sell { color: var(--red); }
+

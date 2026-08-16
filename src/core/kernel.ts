@@ -41,6 +41,7 @@ export interface PyramidLayerView {
   vwap: number;
   notional: number;
   invalidatePrice: number;
+  fillCount: number;
   widthPct: number;
   color: string;
   breached: boolean;
@@ -56,20 +57,25 @@ export interface PyramidView {
   totalNotional: number;
   peakNotional: number;
   status: 'GROWING' | 'PEAKED' | 'COLLAPSING' | 'WRECKED';
+  wreckedAt?: number;
   layers: PyramidLayerView[];
   nLayers: number;
   peakLayers: number;
+  ageMs: number;
 }
 
 export interface DivergenceSignal {
-  /** 'SMART_DUMPING', 'ACCUMULATING', 'CONFIRMING_UP', 'CONFIRMING_DOWN', 'RETAIL_CHOP' */
   type: 'SMART_DUMPING' | 'ACCUMULATING' | 'CONFIRMING_UP' | 'CONFIRMING_DOWN' | 'RETAIL_CHOP' | 'QUIET';
   label: string;
   color: string;
   emoji: string;
-  /** bu sinyalin yon gucunu 0..100 ver */
   strength: number;
 }
+
+/** Regime değişim event'i — UI flash/ses için */
+export type KernelEvent =
+  | { type: 'REGIME_CHANGED'; from: string; to: string; at: number }
+  | RealPyramidEvent;
 
 export interface KernelSnapshot {
   status: KernelStatus;
@@ -82,8 +88,8 @@ export interface KernelSnapshot {
   confidence: number;
   regime: 'ACCUMULATION' | 'DISTRIBUTION' | 'SMART_FOLLOWS_PRICE' | 'RETAIL_DRIVEN' | 'QUIET';
   reasons: string[];
-  shortAgg: Aggregate;   // secili kisa pencere
-  longAgg: Aggregate;    // 1sa veya session
+  shortAgg: Aggregate;
+  longAgg: Aggregate;
   session: {
     startTs: number;
     startPrice: number;
@@ -97,15 +103,20 @@ export interface KernelSnapshot {
     whaleCount: number;
     megaCount: number;
   };
-  thresholds: { LARGE: number; WHALE: number; MEGA: number; sampleSize: number };
-  depth: { ts: number; bids: [number, number][]; asks: [number, number][]; maxQty: number } | null;
+  thresholds: { MICRO: number; SMALL: number; MEDIUM: number; LARGE: number; WHALE: number; MEGA: number; sampleSize: number };
+  depth: { ts: number; bids: [number, number][]; asks: [number, number][]; maxQty: number; obi: number } | null;
   pyramids: PyramidView[];
   wreckedCount: number;
   lastWreckReason: 'REVERSAL' | 'TIMEOUT' | 'VWAP_BREACH' | null;
   lastWreckAt: number;
   divergence: DivergenceSignal;
-  /** secili kisa pencere */
   activeWindowMs: WindowMs;
+  /** Birleşik basınç skoru -1..+1 (smartImb + OBI + recentImb) */
+  pressure: number;
+  /** Piramit tetik eşiğine yakınlık 0..1 */
+  spawnPressure: number;
+  /** VWAP bantları (mini fiyat şeridi için) */
+  vwapBands: { session: number; smart: number; retail: number; short: number; long: number };
 }
 
 const TIER_COLORS: Record<TierId, string> = {
@@ -113,7 +124,13 @@ const TIER_COLORS: Record<TierId, string> = {
   LARGE:  '#22D3EE', WHALE: '#34D399', MEGA:  '#FBBF24',
 };
 
-const PYRAMID_TRIGGER_SCORE = 0.7; // 0.7 smartImb ustunde yeni piramit
+const TIER_EMOJIS: Record<TierId, string> = {
+  MICRO: '🐟', SMALL: '🐠', MEDIUM: '🐡', LARGE: '🦈', WHALE: '🐋', MEGA: '🐳',
+};
+
+const PYRAMID_TRIGGER_SCORE = 0.7;
+
+function clamp1(v: number): number { return Math.max(-1, Math.min(1, v)); }
 
 export class EngineKernel {
   readonly symbol: string;
@@ -134,12 +151,15 @@ export class EngineKernel {
   private lastWreckReason: 'REVERSAL' | 'TIMEOUT' | 'VWAP_BREACH' | null = null;
   private lastWreckAt = 0;
   private pendingSmartFills: Fill[] = [];
+  private lastRegime: string = 'QUIET';
+  private obi = 0;
+  private _obiEma: number | null = null;
 
   private lastSnapshot: KernelSnapshot | null = null;
   private lastSnapshotTs = 0;
   private lastComputeResult: KernelSnapshot | null = null;
 
-  private onPyramidEvent?: (ev: RealPyramidEvent) => void;
+  private onKernelEvent?: (ev: KernelEvent) => void;
 
   private publicWs: WebSocket | null = null;
   private marketWs: WebSocket | null = null;
@@ -150,7 +170,7 @@ export class EngineKernel {
   private publicReady = false;
   private marketReady = false;
 
-  private lastDepth: { ts: number; bids: [number, number][]; asks: [number, number][]; maxQty: number } | null = null;
+  private lastDepth: { ts: number; bids: [number, number][]; asks: [number, number][]; maxQty: number; obi: number } | null = null;
 
   constructor(symbol = 'BTCUSDT') {
     this.symbol = symbol.toUpperCase();
@@ -209,6 +229,10 @@ export class EngineKernel {
     this.lastComputeResult = null;
     this.lastSnapshot = null;
     this.lastSnapshotTs = 0;
+    this.obi = 0;
+    this._obiEma = null;
+    this.lastRegime = 'QUIET';
+    this.tierTracker.reset();
   }
 
   disconnect() {
@@ -221,7 +245,7 @@ export class EngineKernel {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
   }
 
-  onEvent(cb: (ev: RealPyramidEvent) => void) { this.onPyramidEvent = cb; }
+  onEvent(cb: (ev: KernelEvent) => void) { this.onKernelEvent = cb; }
 
   /** React 60 fps'te bunu cagirir */
   snapshot(): KernelSnapshot | null {
@@ -238,15 +262,22 @@ export class EngineKernel {
 
   private internalTick(ts: number) {
     if (this.price <= 0) return;
-    // Hesaplamalar
+    // Hesaplamalar (piramitleri beslemek için önce snapshot)
     this.lastComputeResult = this.computeSnapshot(ts);
-    
+
+    // Regime değişimi event'i
+    const newRegime = this.lastComputeResult.regime;
+    if (newRegime !== this.lastRegime && this.lastRegime !== 'idle') {
+      this.onKernelEvent?.({ type: 'REGIME_CHANGED', from: this.lastRegime, to: newRegime, at: ts });
+    }
+    this.lastRegime = newRegime;
 
     // Piramitleri güncelle
     const fills = this.pendingSmartFills;
     this.pendingSmartFills = [];
     const shortAgg = this.lastComputeResult.shortAgg;
-    const flowScore = shortAgg.smartImb; // -1..+1
+    // Bileşik akış skoru: smartImb ağırlıklı + son 5sn momentum + OBI
+    const flowScore = clamp1(shortAgg.smartImb * 0.55 + shortAgg.recentImb * 0.25 + this.obi * 0.20);
 
     for (const p of this.pyramids) {
       if (p.status === 'WRECKED') continue;
@@ -256,41 +287,80 @@ export class EngineKernel {
           this.wreckedCount++;
           this.lastWreckReason = ev.reason;
           this.lastWreckAt = ts;
+          // WRECKED piramitlere kendi wreckedAt'larını ekle (2sn ekranda kalacaklar)
+          (p as RealPyramid & { _wreckedAt?: number })._wreckedAt = ts;
         }
-        this.onPyramidEvent?.(ev);
+        this.onKernelEvent?.(ev);
       }
     }
-    this.pyramids = this.pyramids.filter(p => p.status !== 'WRECKED' || ts - p.lastGrowthTs < 2000);
 
-    // Yeni piramit tetikleme: divergence'a gore daha akilli
-    const hasBuy = this.pyramids.some(p => p.side === 'BUY' && p.status !== 'WRECKED');
-    const hasSell = this.pyramids.some(p => p.side === 'SELL' && p.status !== 'WRECKED');
+    // 2sn grace: WRECKED piramitleri 2sn boyunca ekranda tut (yıkım animasyonu için)
+    this.pyramids = this.pyramids.filter(p => {
+      if (p.status !== 'WRECKED') return true;
+      const wa = (p as RealPyramid & { _wreckedAt?: number })._wreckedAt;
+      return wa != null && ts - wa < 2000;
+    });
 
-    // Yeni piramit: kisa vade akilli para skoru TRIGGER ustundeyse + ters piramit yoksa
-    if (!hasBuy && !hasSell && fills.length > 0) {
-      const seed = fills
-        .filter(f => f.side === 'BUY' && (f.tier === 'LARGE' || f.tier === 'WHALE' || f.tier === 'MEGA'))
-        .sort((a, b) => b.notional - a.notional)[0];
-      const seedSell = fills
-        .filter(f => f.side === 'SELL' && (f.tier === 'LARGE' || f.tier === 'WHALE' || f.tier === 'MEGA'))
-        .sort((a, b) => b.notional - a.notional)[0];
-      // Akıllı para sinyaline göre yon ver
-      if (flowScore >= PYRAMID_TRIGGER_SCORE && seed && seed.notional > 5000) {
-        const p = spawnRealPyramid(this.symbol, 'BUY', seed.price, seed.tier, seed.notional, undefined, ts);
-        this.pyramids.push(p);
-        this.onPyramidEvent?.({ type: 'LAYER_ADDED', pyramid: p, level: 1, tier: seed.tier });
-      } else if (flowScore <= -PYRAMID_TRIGGER_SCORE && seedSell && seedSell.notional > 5000) {
-        const p = spawnRealPyramid(this.symbol, 'SELL', seedSell.price, seedSell.tier, seedSell.notional, undefined, ts);
-        this.pyramids.push(p);
-        this.onPyramidEvent?.({ type: 'LAYER_ADDED', pyramid: p, level: 1, tier: seedSell.tier });
-      }
+    // ── Çoklu piramit: aynı anda hem BUY hem SELL açılabilsin ──
+    // Her iki taraf için de ayrı ayrı spawn et; ters taraf mevcut olması engel değil.
+    const hasBuyActive = this.pyramids.some(p => p.side === 'BUY' && p.status !== 'WRECKED');
+    const hasSellActive = this.pyramids.some(p => p.side === 'SELL' && p.status !== 'WRECKED');
+
+    const spawnThreshold = this._dynSpawnThreshold(flowScore, newRegime);
+
+    // BUY adayı: bu saniyedeki en büyük BUY smart fill
+    const seedBuy = fills
+      .filter(f => f.side === 'BUY' && (f.tier === 'LARGE' || f.tier === 'WHALE' || f.tier === 'MEGA'))
+      .reduce<Fill | null>((best, f) => (!best || f.notional > best.notional ? f : best), null);
+    // SELL adayı
+    const seedSell = fills
+      .filter(f => f.side === 'SELL' && (f.tier === 'LARGE' || f.tier === 'WHALE' || f.tier === 'MEGA'))
+      .reduce<Fill | null>((best, f) => (!best || f.notional > best.notional ? f : best), null);
+
+    if (!hasBuyActive && flowScore >= spawnThreshold && seedBuy && seedBuy.notional > 5000) {
+      const p = spawnRealPyramid(this.symbol, 'BUY', seedBuy.price, seedBuy.tier, seedBuy.notional, undefined, ts);
+      this.pyramids.push(p);
+      this.onKernelEvent?.({ type: 'LAYER_ADDED', pyramid: p, level: 1, tier: seedBuy.tier });
     }
+    if (!hasSellActive && flowScore <= -spawnThreshold && seedSell && seedSell.notional > 5000) {
+      const p = spawnRealPyramid(this.symbol, 'SELL', seedSell.price, seedSell.tier, seedSell.notional, undefined, ts);
+      this.pyramids.push(p);
+      this.onKernelEvent?.({ type: 'LAYER_ADDED', pyramid: p, level: 1, tier: seedSell.tier });
+    }
+
+    // snapshot'ı basınç/OBI ile zenginleştir
+    this.lastComputeResult = this._enrichSnapshot(this.lastComputeResult, ts, flowScore, spawnThreshold);
+  }
+
+  /** Regime ve flowScore'a göre dinamik piramit eşik (güçlü akümülasyonda daha kolay doğsun) */
+  private _dynSpawnThreshold(flowScore: number, regime: string): number {
+    let th = PYRAMID_TRIGGER_SCORE; // 0.7
+    if (regime === 'ACCUMULATION' && flowScore > 0) th = Math.max(0.35, th - 0.30);
+    else if (regime === 'DISTRIBUTION' && flowScore < 0) th = Math.max(0.35, th - 0.30);
+    else if (regime === 'SMART_FOLLOWS_PRICE') th = Math.max(0.45, th - 0.15);
+    else if (regime === 'RETAIL_DRIVEN') th += 0.25;
+    else if (Math.abs(this.obi) < 0.05 && Math.abs(flowScore) < 0.2) th += 0.15; // low-vol: zorlaştır
+    return Math.max(0.25, Math.min(0.95, th));
+  }
+
+  /** computeSnapshot sonrası basınç/OBI/vwapBands alanlarını doldur */
+  private _enrichSnapshot(prev: KernelSnapshot, ts: number, flowScore: number, spawnTh: number): KernelSnapshot {
+    void ts;
+    // flowScore zaten internalTick'te aynı formülle hesaplanmış, onu kullan
+    const pressure = clamp1(flowScore);
+    const spawnPressure = Math.min(1, Math.abs(pressure) / spawnTh);
+    return {
+      ...prev,
+      pressure,
+      spawnPressure,
+    };
   }
 
   // ===== HESAPLAMA =====
 
   private buildEmptySnapshot(): KernelSnapshot {
-    const empty = this.buckets.aggregate(60_000, '1dk', Date.now());
+    const now = Date.now();
+    const empty = this.buckets.aggregate(60_000, '1dk', now);
     return {
       status: this.status,
       symbol: this.symbol,
@@ -303,10 +373,13 @@ export class EngineKernel {
         vwap: 0, smartVwap: 0, retailVwap: 0, smartImb: 0, retailImb: 0,
         whaleCount: 0, megaCount: 0,
       },
-      thresholds: { LARGE: 10_000, WHALE: 100_000, MEGA: 1_000_000, sampleSize: 0 },
+      thresholds: { MICRO: 0, SMALL: 100, MEDIUM: 1_000, LARGE: 10_000, WHALE: 100_000, MEGA: 1_000_000, sampleSize: 0 },
       depth: null, pyramids: [], wreckedCount: 0, lastWreckReason: null, lastWreckAt: 0,
       divergence: { type: 'QUIET', label: 'Beklemede', color: '#7C8DB0', emoji: '🔇', strength: 0 },
       activeWindowMs: this.activeWindowMs,
+      pressure: 0,
+      spawnPressure: 0,
+      vwapBands: { session: 0, smart: 0, retail: 0, short: 0, long: 0 },
     };
   }
 
@@ -323,26 +396,22 @@ export class EngineKernel {
     const sessionVwap = s.qty > 0 ? s.pq / s.qty : this.price;
     const sessionSmartVwap = s.smartQty > 0 ? s.smartPq / s.smartQty : sessionVwap;
     const sessionRetailVwap = s.retailQty > 0 ? s.retailPq / s.retailQty : sessionVwap;
-    const sVol = (() => {
-      let b = 0, ss = 0;
-      for (const tid of ['MICRO','SMALL','MEDIUM'] as TierId[]) {
-        b += s.tiers[tid].buyVol; ss += s.tiers[tid].sellVol;
-      }
-      return { buy: b, sell: ss };
-    })();
-    const sVol2 = (() => {
-      let b = 0, ss = 0;
-      for (const tid of ['LARGE','WHALE','MEGA'] as TierId[]) {
-        b += s.tiers[tid].buyVol; ss += s.tiers[tid].sellVol;
-      }
-      return { buy: b, sell: ss };
-    })();
-    const sessionSmartVol = sVol2.buy + sVol2.sell;
-    const sessionRetailVol = sVol.buy + sVol.sell;
-    const sessionSmartImb = sessionSmartVol > 0 ? (sVol2.buy - sVol2.sell) / sessionSmartVol : 0;
-    const sessionRetailImb = sessionRetailVol > 0 ? (sVol.buy - sVol.sell) / sessionRetailVol : 0;
+    const shortVwap = shortAgg.vwap;
+    const longVwap = longAgg.vwap;
 
-    // Rejim & divergence tespiti — İKİ PENCERENİN ÇAKIŞMASI
+    // Session smart/retail imbalans
+    const { sSmartB, sSmartS, sRetB, sRetS } = (() => {
+      let b1 = 0, s1 = 0, b2 = 0, s2 = 0;
+      for (const tid of ['MICRO','SMALL','MEDIUM'] as TierId[]) { b1 += s.tiers[tid].buyVol; s1 += s.tiers[tid].sellVol; }
+      for (const tid of ['LARGE','WHALE','MEGA'] as TierId[]) { b2 += s.tiers[tid].buyVol; s2 += s.tiers[tid].sellVol; }
+      return { sSmartB: b2, sSmartS: s2, sRetB: b1, sRetS: s1 };
+    })();
+    const sessionSmartVol = sSmartB + sSmartS;
+    const sessionRetailVol = sRetB + sRetS;
+    const sessionSmartImb = sessionSmartVol > 0 ? (sSmartB - sSmartS) / sessionSmartVol : 0;
+    const sessionRetailImb = sessionRetailVol > 0 ? (sRetB - sRetS) / sessionRetailVol : 0;
+
+    // Rejim & divergence
     const short = shortAgg;
     const long = longAgg;
     let regime: KernelSnapshot['regime'] = 'QUIET';
@@ -357,7 +426,6 @@ export class EngineKernel {
     const priceDn = short.priceChangePct < -0.001;
     const hasEnoughVol = short.totalVol > 500_000;
 
-    // Divergence matrisi
     if (hasEnoughVol) {
       const shortBuying = shortSmart > 0.2;
       const shortSelling = shortSmart < -0.2;
@@ -365,84 +433,66 @@ export class EngineKernel {
       const longSelling = longSmart < -0.15;
 
       if (priceUp && longSelling && shortBuying && long.totalVol > short.totalVol * 2) {
-        // Fiyat yukari ama uzun vadeli akilli para satis tarafında, kisa vade perakende/short covering aliyor
         regime = 'DISTRIBUTION';
-        divergence = {
-          type: 'SMART_DUMPING',
-          label: 'BALİNA ÇIKIŞTA — DİSTRİBÜSYON',
-          color: '#F87171', emoji: '📤', strength: Math.round(Math.abs(longSmart) * 100),
-        };
-        reasons.push(`📤 DİSTRİBÜSYON: Fiyat yükseliyor ama son 1saattir balinalar satıyor (uzun vade imbalans ${(longSmart*100).toFixed(0)}%). Kısa vade alımı perakende. Tepe dağıtımı olabilir.`);
+        divergence = { type: 'SMART_DUMPING', label: 'BALİNA ÇIKIŞTA — DİSTRİBÜSYON',
+          color: '#F87171', emoji: '📤', strength: Math.round(Math.abs(longSmart) * 100) };
+        reasons.push(`📤 DİSTRİBÜSYON: Fiyat ↑ ama 1saattir balina satıyor (uzun ${(longSmart*100).toFixed(0)}%). Kısa vade alımı perakende — TEPE.`);
       } else if (priceDn && longBuying && shortSelling && long.totalVol > short.totalVol * 2) {
         regime = 'ACCUMULATION';
-        divergence = {
-          type: 'ACCUMULATING',
-          label: 'DİP TOPLAMA — AKÜMÜLASYON',
-          color: '#34D399', emoji: '📥', strength: Math.round(longSmart * 100),
-        };
-        reasons.push(`📥 AKÜMÜLASYON: Fiyat düşüyor ama son 1saattir balinalar alımda (uzun vade ${(longSmart*100).toFixed(0)}% alıcı). Kısa vade perakende panik satışı. Dip toplama.`);
+        divergence = { type: 'ACCUMULATING', label: 'DİP TOPLAMA — AKÜMÜLASYON',
+          color: '#34D399', emoji: '📥', strength: Math.round(longSmart * 100) };
+        reasons.push(`📥 AKÜMÜLASYON: Fiyat ↓ ama 1saattir balina alıyor (uzun ${(longSmart*100).toFixed(0)}%). Kısa vade panik satışı — DİP.`);
       } else if (shortBuying && longBuying) {
         regime = 'SMART_FOLLOWS_PRICE';
-        divergence = {
-          type: 'CONFIRMING_UP',
-          label: 'AKILLI PARA ALIYOR — TEYİTLİ YÜKSELİŞ',
-          color: '#22D3EE', emoji: '🎯', strength: Math.round((Math.abs(shortSmart) + Math.abs(longSmart)) * 50),
-        };
-        reasons.push(`🎯 Teyitli yükseliş: hem kısa (${(shortSmart*100).toFixed(0)}%) hem uzun vade (${(longSmart*100).toFixed(0)}%) balina alımda.`);
+        divergence = { type: 'CONFIRMING_UP', label: 'AKILLI PARA ALIYOR — TEYİTLİ ↑',
+          color: '#22D3EE', emoji: '🎯', strength: Math.round((Math.abs(shortSmart)+Math.abs(longSmart))*50) };
+        reasons.push(`🎯 Teyitli yükseliş: kısa ${(shortSmart*100).toFixed(0)}% / uzun ${(longSmart*100).toFixed(0)}% balina alıcı.`);
       } else if (shortSelling && longSelling) {
         regime = 'SMART_FOLLOWS_PRICE';
-        divergence = {
-          type: 'CONFIRMING_DOWN',
-          label: 'AKILLI PARA SATIYOR — TEYİTLİ DÜŞÜŞ',
-          color: '#FBBF24', emoji: '🎯', strength: Math.round((Math.abs(shortSmart) + Math.abs(longSmart)) * 50),
-        };
-        reasons.push(`🎯 Teyitli düşüş: hem kısa (${(shortSmart*100).toFixed(0)}%) hem uzun vade (${(longSmart*100).toFixed(0)}%) balina satımda.`);
+        divergence = { type: 'CONFIRMING_DOWN', label: 'AKILLI PARA SATIYOR — TEYİTLİ ↓',
+          color: '#FBBF24', emoji: '🎯', strength: Math.round((Math.abs(shortSmart)+Math.abs(longSmart))*50) };
+        reasons.push(`🎯 Teyitli düşüş: kısa ${(shortSmart*100).toFixed(0)}% / uzun ${(longSmart*100).toFixed(0)}% balina satıcı.`);
       } else if (short.recentImb > 0.3 && longSmart < -0.1) {
         regime = 'RETAIL_DRIVEN';
-        divergence = {
-          type: 'SMART_DUMPING',
-          label: 'KISA VADE PERAKENDE ALIYOR, BALİNA SATIYOR',
-          color: '#A78BFA', emoji: '⚠️', strength: Math.round(Math.abs(longSmart) * 100),
-        };
-        reasons.push(`⚠️ Son 5sn alım baskısı ama uzun vade balina satışı. Dikkatli ol.`);
+        divergence = { type: 'SMART_DUMPING', label: 'PERAKENDE ALIYOR, BALİNA SATIYOR',
+          color: '#A78BFA', emoji: '⚠️', strength: Math.round(Math.abs(longSmart)*100) };
+        reasons.push('⚠️ Son 5sn alım ama uzun vade balina satıyor — tuzaq olabilir.');
       } else if (Math.abs(shortSmart) < 0.15 && Math.abs(longSmart) < 0.1) {
-        divergence = { type: 'RETAIL_CHOP', label: 'Piyasa chop, balina yok', color: '#A78BFA', emoji: '🐟', strength: 10 };
-        reasons.push('🐟 Chop bölgesi — balina yok, perakende sürüklüyor. Wait.');
+        divergence = { type: 'RETAIL_CHOP', label: 'CHOP — balina yok', color: '#A78BFA', emoji: '🐟', strength: 10 };
+        reasons.push('🐟 Chop — balina yok, elini sokma.');
       } else {
-        divergence = { type: 'QUIET', label: 'Tarafsız bölge', color: '#7C8DB0', emoji: '⏸', strength: 10 };
-        reasons.push('⏸ Tarafsız bölge — net sinyal yok.');
+        divergence = { type: 'QUIET', label: 'Tarafsız', color: '#7C8DB0', emoji: '⏸', strength: 10 };
+        reasons.push('⏸ Tarafsız — net sinyal yok.');
       }
     } else {
       divergence = { type: 'QUIET', label: 'Hacim düşük', color: '#7C8DB0', emoji: '🔇', strength: 0 };
-      reasons.push('🔇 Düşük hacim — beklemede.');
+      reasons.push('🔇 Düşük hacim — bekle.');
     }
 
-    // Mega/balina işlem sayısı bilgisi
-    if (short.megaCount > 0) {
-      reasons.push(`🐳 Son ${short.windowLabel} penceresinde ${short.megaCount} adet MEGA (>${formatCompactShort(th.MEGA)}) işlem!`);
-    } else if (short.whaleCount > 5) {
-      reasons.push(`🐋 Son ${short.windowLabel} içinde ${short.whaleCount} adet balina (>${formatCompactShort(th.WHALE)}) işlemi.`);
+    // OBI bilgisi
+    if (Math.abs(this.obi) > 0.25) {
+      reasons.push(`📚 Emir defteri ${this.obi>0?'alıcı':'satıcı'} baskın (OBI ${(this.obi*100).toFixed(0)}%).`);
     }
 
-    // Tier öne çıkan
+    if (short.megaCount > 0) reasons.push(`🐳 Son ${short.windowLabel}: ${short.megaCount} MEGA (>${formatCompactShort(th.MEGA)})!`);
+    else if (short.whaleCount > 5) reasons.push(`🐋 Son ${short.windowLabel}: ${short.whaleCount} balina (>${formatCompactShort(th.WHALE)}).`);
+
     const strongest = (['MEGA','WHALE','LARGE'] as TierId[])
       .map(id => ({ id, m: short.tiers[id] }))
       .filter(x => x.m.buyVol + x.m.sellVol > th.LARGE)
       .sort((a, b) => Math.abs(b.m.delta) - Math.abs(a.m.delta))[0];
     if (strongest) {
-      const emojis: Record<TierId, string> = { MICRO: '🐟', SMALL: '🐠', MEDIUM: '🐡', LARGE: '🦈', WHALE: '🐋', MEGA: '🐳' };
-      reasons.push(`${emojis[strongest.id]} ${strongest.id}: ${strongest.m.imbalance > 0 ? 'alıcı' : 'satıcı'} baskın (${(strongest.m.imbalance*100).toFixed(0)}%).`);
+      reasons.push(`${TIER_EMOJIS[strongest.id]} ${strongest.id}: ${strongest.m.imbalance > 0 ? 'alıcı' : 'satıcı'} baskın (${(strongest.m.imbalance*100).toFixed(0)}%).`);
     }
 
-    if (short.recentImb > 0.4) reasons.push('⚡ Son 5sn: alım baskısı artıyor.');
-    else if (short.recentImb < -0.4) reasons.push('⚡ Son 5sn: satım baskısı artıyor.');
+    if (short.recentImb > 0.4) reasons.push('⚡ Son 5sn: alım baskısı ↑.');
+    else if (short.recentImb < -0.4) reasons.push('⚡ Son 5sn: satım baskısı ↑.');
 
-    if (th.sampleSize < 100) {
-      reasons.push(`📊 Adaptif eşik toplanıyor (${th.sampleSize}/100)...`);
-    }
+    if (th.sampleSize < 100) reasons.push(`📊 Adaptif eşik toplanıyor (${th.sampleSize}/100)...`);
 
-    // Skor hesapla — short ve long birlikte
-    let score = short.smartImb * 50 + long.smartImb * 30 + short.recentImb * 20;
+    // Skor: smartImb + long + recentImb + OBI
+    let score = short.smartImb * 40 + long.smartImb * 25 + short.recentImb * 20 + this.obi * 15;
+    score *= 100;
     if (regime === 'ACCUMULATION') score += 25;
     if (regime === 'DISTRIBUTION') score -= 25;
     if (divergence.type === 'RETAIL_CHOP') score *= 0.4;
@@ -461,9 +511,10 @@ export class EngineKernel {
       const vwap = pyramidVWAP(p);
       const pnl = pyramidPnLPct(p, this.price);
       const total = p.totalNotional;
+      const maxPeakLayers = Math.max(p.peakLayers, p.layers.length);
       const layers: PyramidLayerView[] = p.layers.map(layer => {
-        const share = total > 0 ? layer.notional / total : 1 / p.layers.length;
-        const posFromBase = layer.level / Math.max(p.peakLayers, p.layers.length);
+        const share = total > 0 ? layer.notional / total : 1 / Math.max(p.layers.length, 1);
+        const posFromBase = layer.level / maxPeakLayers;
         const baseWidth = 30 + posFromBase * 50;
         const widthPct = Math.min(95, Math.max(15, baseWidth + share * 30));
         const breached = p.side === 'BUY'
@@ -476,11 +527,13 @@ export class EngineKernel {
           vwap: layer.vwap,
           notional: layer.notional,
           invalidatePrice: layer.invalidatePrice,
+          fillCount: layer.fillCount,
           widthPct,
           color: TIER_COLORS[layer.dominantTier],
           breached,
         };
       });
+      const wreckedAt = (p as RealPyramid & { _wreckedAt?: number })._wreckedAt;
       return {
         id: p.id,
         side: p.side,
@@ -491,9 +544,11 @@ export class EngineKernel {
         totalNotional: total,
         peakNotional: p.peakNotional,
         status: p.status,
+        wreckedAt,
         layers,
         nLayers: p.layers.length,
         peakLayers: p.peakLayers,
+        ageMs: ts - p.entryTs,
       };
     });
 
@@ -523,14 +578,17 @@ export class EngineKernel {
         whaleCount: s.whaleCount,
         megaCount: s.megaCount,
       },
-      thresholds: { LARGE: th.LARGE, WHALE: th.WHALE, MEGA: th.MEGA, sampleSize: th.sampleSize },
-      depth: this.lastDepth,
+      thresholds: { MICRO: 0, SMALL: th.SMALL, MEDIUM: th.MEDIUM, LARGE: th.LARGE, WHALE: th.WHALE, MEGA: th.MEGA, sampleSize: th.sampleSize },
+      depth: this.lastDepth ? { ...this.lastDepth, obi: this.obi } : null,
       pyramids: pyramidViews,
       wreckedCount: this.wreckedCount,
       lastWreckReason: this.lastWreckReason,
       lastWreckAt: this.lastWreckAt,
       divergence,
       activeWindowMs: this.activeWindowMs,
+      pressure: clamp1((short.smartImb * 0.55 + short.recentImb * 0.25 + this.obi * 0.20)),
+      spawnPressure: 0, // _enrichSnapshot tarafından doldurulur
+      vwapBands: { session: sessionVwap, smart: sessionSmartVwap, retail: sessionRetailVwap, short: shortVwap, long: longVwap },
     };
   }
 
@@ -557,6 +615,24 @@ export class EngineKernel {
   }
 
   private onDepth(ts: number, bids: [number, number][], asks: [number, number][]) {
+    // En iyi 8 seviye üzerinden notional-ağırlıklı OBI
+    const N = 8;
+    let bidQ = 0, askQ = 0, bidPq = 0, askPq = 0;
+    for (let i = 0; i < Math.min(N, bids.length); i++) {
+      const [p, q] = bids[i];
+      bidQ += q; bidPq += p * q;
+    }
+    for (let i = 0; i < Math.min(N, asks.length); i++) {
+      const [p, q] = asks[i];
+      askQ += q; askPq += p * q;
+    }
+    const bidN = bidPq, askN = askPq;
+    const tot = bidN + askN;
+    this.obi = tot > 0 ? (bidN - askN) / tot : 0;
+    // EMA ile yumuşat (ani spike'ları kırpar)
+    this._obiEma = this._obiEma == null ? this.obi : this._obiEma * 0.75 + this.obi * 0.25;
+    this.obi = clamp1(this._obiEma);
+
     const allQ: number[] = [];
     for (const [, q] of bids) allQ.push(q);
     for (const [, q] of asks) allQ.push(q);
@@ -567,7 +643,9 @@ export class EngineKernel {
       bids: bids.slice(0, 20),
       asks: asks.slice(0, 20),
       maxQty,
+      obi: this.obi,
     };
+    void bidQ; void askQ;
   }
 
   // ===== WEBSOCKET =====

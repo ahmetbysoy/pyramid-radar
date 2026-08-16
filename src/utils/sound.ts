@@ -92,3 +92,17 @@ export function playSignal(signal: 'BUY' | 'SELL' | 'WAIT'): void {
 export function playWhaleAlert(side: 'BUY' | 'SELL'): void {
   tone(side === 'BUY' ? 880 : 220, 240, 'triangle', 0.18, side === 'BUY' ? 1320 : 110);
 }
+
+/** Rejim değişimi (ACC / DISTR / CONFIRM) — kısa dikkat çekici ton */
+export function playRegimeChange(regime: string): void {
+  if (regime === 'ACCUMULATION' || regime === 'SMART_FOLLOWS_PRICE' && regime.includes('UP')) {
+    tone(523, 80, 'sine', 0.08);
+    setTimeout(() => tone(784, 140, 'sine', 0.10), 60);
+  } else if (regime === 'DISTRIBUTION') {
+    tone(392, 80, 'sine', 0.08);
+    setTimeout(() => tone(262, 140, 'sine', 0.10), 60);
+  } else if (regime === 'RETAIL_DRIVEN' || regime === 'RETAIL_CHOP') {
+    tone(440, 90, 'triangle', 0.07, 380);
+  }
+}
+

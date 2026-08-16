@@ -3,7 +3,7 @@ import { fetchExchangeInfo, getMeta } from '../utils/exchangeInfo';
 import { formatPrice, formatPct, formatCompact } from '../utils/format';
 import { EngineKernel, type WindowMs } from '../core/kernel';
 import { Cockpit } from '../ui/Cockpit';
-import { playLayerAdded, playLayerRemoved, playWreck, playWhaleAlert, tone } from '../utils/sound';
+import { playLayerAdded, playLayerRemoved, playWreck, playWhaleAlert, tone, playRegimeChange } from '../utils/sound';
 import { fireConfetti } from '../utils/confetti';
 import type { SymbolMeta, WsStatus } from '../types';
 import '../styles/global.css';
@@ -43,7 +43,9 @@ export function App() {
       if (!soundOnRef.current) return;
       if (ev.type === 'LAYER_ADDED') { playLayerAdded(ev.level); fireConfetti(ev.pyramid.side, 0.5, 0.4, 40+ev.level*8); }
       else if (ev.type === 'LAYER_REMOVED') { playLayerRemoved(ev.level); }
-      else if (ev.type === 'WRECKED') { playWreck(ev.pyramid.side); fireConfetti(ev.pyramid.side, 0.5, 0.4, 180); }
+      else if (ev.type === 'WRECKED') { playWreck(ev.pyramid.side); fireConfetti(ev.pyramid.side, 0.5, 0.4, 200); }
+      else if (ev.type === 'REGIME_CHANGED') { playRegimeChange(ev.to); }
+      else if (ev.type === 'LAYER_FILLED') { /* hafif dolum — şimdilik sessiz */ }
     });
 
     kernel.connect();

@@ -38,12 +38,20 @@ export interface RealLayer {
   notional: number;
   /** Katmandaki toplam coin miktarı (VWAP = notional / qtyBase) */
   qtyBase: number;
+  /** Bu katmana kaç adet smart-money fill düştü */
+  fillCount: number;
+  /** Tier bazında fill notional (dominant tier'ı hesaplamak + UI için) */
+  tierNotional: Record<TierId, number>;
   /** İlk dolgu zamanı */
   addTs: number;
   /** Son dolgu zamanı */
   lastFillTs: number;
   /** Katman kırılma (invalidate) fiyatı */
   invalidatePrice: number;
+}
+
+function emptyLayerTiers(): Record<TierId, number> {
+  return { MICRO: 0, SMALL: 0, MEDIUM: 0, LARGE: 0, WHALE: 0, MEGA: 0 };
 }
 
 export interface RealPyramid {
@@ -95,6 +103,8 @@ export function spawnRealPyramid(
   ts: number = Date.now(),
 ): RealPyramid {
   const qtyBase = notional / price;
+  const tN = emptyLayerTiers();
+  tN[tier] = notional;
   const firstLayer: RealLayer = {
     level: 1,
     dominantTier: tier,
@@ -102,6 +112,8 @@ export function spawnRealPyramid(
     vwap: price,
     notional,
     qtyBase,
+    fillCount: 1,
+    tierNotional: tN,
     addTs: ts,
     lastFillTs: ts,
     invalidatePrice: invalidatePriceForLayer(price, side, config.layerRemovePct),
@@ -197,6 +209,16 @@ export function updateRealPyramid(
       top.notional += f.notional;
       top.qtyBase += f.qty;
       top.vwap = top.qtyBase > 0 ? top.notional / top.qtyBase : top.vwap;
+      top.fillCount += 1;
+      top.tierNotional[f.tier] = (top.tierNotional[f.tier] ?? 0) + f.notional;
+      // Dominant tier: en yüksek notional'a sahip tier
+      let best: TierId = top.dominantTier;
+      let bestV = top.tierNotional[top.dominantTier] ?? 0;
+      for (const tId of ['LARGE','WHALE','MEGA'] as TierId[]) {
+        const v = top.tierNotional[tId] ?? 0;
+        if (v > bestV) { bestV = v; best = tId; }
+      }
+      top.dominantTier = best;
       top.lastFillTs = ts;
       p.totalNotional += f.notional;
       p.totalQtyBase += f.qty;
@@ -228,16 +250,12 @@ export function updateRealPyramid(
       const dominantTier: TierId =
         sameSideFills[sameSideFills.length - 1]?.tier ?? 'LARGE';
 
-      // Yeni katman: anchor olarak lastPrice kullan, başlangıç notional'ı 0.
-      // Pending sadece eşik sayacıydı, içindeki dolgu zaten eski katmanda sayıldı —
-      // double-count yapmamak için sıfırdan başlarız.
-      // Pending dolgu yeni katmanın tohumudur — double-count olmaması için
-      // eski katmandan düşeriz (pending eski katmanda "birikmiş" sayılıyordu).
-      // Ancak pendingNotional eski dolguların ÜSTÜNE eklenen sayacı tuttuğundan
-      // aslında double-count yok, çünkü pending her zaman 0'dan sayacağa resetlenir.
-      // Yeni katman min addThreshold kadar tohumla açılır:
+      // Yeni katman addThreshold kadar gerçek tohum notional ile açılır — 0-notional hayalet yok.
+      // Tohum, zaten son katmana eklenmiş olan pending dolgusundan karşılanır (double-count yok).
       const seedNotional = addThreshold;
       const seedQty = seedNotional / lastPrice;
+      const seedTiers = emptyLayerTiers();
+      seedTiers[dominantTier] = seedNotional;
       const newLayer: RealLayer = {
         level: newLevel,
         dominantTier,
@@ -245,6 +263,8 @@ export function updateRealPyramid(
         vwap: lastPrice,
         notional: seedNotional,
         qtyBase: seedQty,
+        fillCount: 1,
+        tierNotional: seedTiers,
         addTs: ts,
         lastFillTs: ts,
         invalidatePrice: invalidatePriceForLayer(lastPrice, p.side, cfg.layerRemovePct),
