@@ -370,6 +370,174 @@ html, body, #root {
 }
 .stats-row b { color: var(--text); font-weight: 700; }
 
+/* ─── PİRAMİT GÖRSELİ ────────────────── */
+.pyramid-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  position: relative;
+  overflow: hidden;
+}
+
+.pyramid-wrap {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  min-height: 200px;
+}
+.pyramid-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.pyr-side {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px;
+}
+.pyr-buy { align-items: flex-start; }
+.pyr-sell { align-items: flex-end; }
+.pyr-empty {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  padding: 20px 8px;
+  opacity: 0.7;
+}
+.pyr-stack {
+  width: 100%;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+.pyr-stack.pyr-status--growing { animation: glow-pulse 2s infinite; }
+.pyr-stack.pyr-status--peaked { border-color: var(--amber); }
+.pyr-stack.pyr-status--collapsing { animation: shake 0.25s infinite; border-color: #F87171; }
+.pyr-stack.pyr-status--wrecked { opacity: 0.3; }
+
+@keyframes glow-pulse {
+  0%,100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 20px rgba(52,211,153,0.2); }
+}
+@keyframes shake {
+  0%,100% { transform: translateX(0); }
+  25% { transform: translateX(-2px); }
+  75% { transform: translateX(2px); }
+}
+
+.pyr-stack-head {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.pyr-stack-title {
+  display: block;
+  letter-spacing: 0.05em;
+}
+.pyr-stack-meta {
+  display: block;
+  font-weight: 400;
+  font-size: 0.62rem;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.pyr-layers {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
+  /* taban katman altta, tepede en yeni katman */
+}
+.pyr-buy .pyr-layers { align-items: flex-end; }
+.pyr-sell .pyr-layers { align-items: flex-start; }
+
+.pyr-layer {
+  height: 18px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: rgba(255,255,255,0.95);
+  transition: width 0.3s ease, box-shadow 0.3s ease;
+}
+.pyr-layer--placeholder {
+  background: repeating-linear-gradient(45deg, rgba(124,141,176,0.08) 0 6px, rgba(124,141,176,0.02) 6px 12px);
+  border: 1px dashed rgba(124,141,176,0.2);
+  color: var(--muted);
+  box-shadow: none !important;
+}
+.pyr-lvl { opacity: 0.9; }
+.pyr-notional { opacity: 0.8; font-size: 0.6rem; }
+
+.pyr-stack-foot {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--muted);
+}
+.pyr-stack-foot b { color: var(--text); font-weight: 700; }
+.pyr-status-tag { font-weight: 700; letter-spacing: 0.05em; }
+
+.pyr-footer {
+  position: absolute;
+  bottom: 4px;
+  left: 0; right: 0;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--muted);
+  z-index: 2;
+}
+.pyr-wreck-reason { color: var(--red); }
+
+.sound-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+}
+.sound-btn.on { color: var(--green); border-color: var(--green); }
+.sound-btn:hover { color: var(--text); }
+
+/* ─── RESPONSIVE ─────────────────────── */
+@media (min-width: 768px) {
+  .app--full { max-width: 780px; }
+  .main-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    align-content: start;
+  }
+  .signal-panel { grid-column: 1 / -1; }
+  .pyramid-panel { grid-column: 1 / -1; }
+  .book-panel { grid-column: 1 / -1; }
+}
+
 /* ─── FOOTER ─────────────────────────── */
 .ftr {
   flex-shrink: 0;

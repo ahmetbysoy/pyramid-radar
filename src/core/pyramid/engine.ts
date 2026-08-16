@@ -1,9 +1,7 @@
-import type { Side } from './types';
-import {
-  DEFAULT_PYRAMID_CONFIG,
-  type PyramidConfig,
-  type PyramidState,
-} from './types';
+import type { Side, PyramidConfig, PyramidState } from './types';
+import { DEFAULT_PYRAMID_CONFIG } from './types';
+export type { PyramidState, PyramidConfig, Side } from './types';
+export { DEFAULT_PYRAMID_CONFIG };
 
 let _idCounter = 0;
 function newId(): string {
@@ -44,7 +42,11 @@ export function spawnPyramid(
     ),
     status: 'GROWING',
     peakLayers: 1,
-  };
+    /** @internal son katman eklenme zamanı */
+    _lastGrowthTs: ts,
+    /** @internal yaşam boyu zirve notional */
+    _peakNotional: config.baseNotional,
+  } as PyramidState;
 }
 
 /**
@@ -89,6 +91,8 @@ export function currentPnLPct(p: PyramidState, lastPrice: number): number {
  */
 export type PyramidEvent =
   | { type: 'LAYER_ADDED'; pyramid: PyramidState; level: number }
+  | { type: 'PEAKED'; pyramid: PyramidState }
+  | { type: 'COLLAPSING'; pyramid: PyramidState; remainingLayers: number }
   | { type: 'LAYER_REMOVED'; pyramid: PyramidState; level: number }
   | { type: 'WRECKED'; pyramid: PyramidState; reason: 'REVERSAL' | 'TIMEOUT' };
 
@@ -114,14 +118,19 @@ export function updatePyramid(
     (p.side === 'BUY' && indicatorScore > 0.3) ||
     (p.side === 'SELL' && indicatorScore < -0.3);
 
+  let layersAdded = 0;
+
   // ─── Katman ekleme ─────────────────────────────────────
   if (sideAligns) {
-    const hitThreshold =
-      p.side === 'BUY'
-        ? lastPrice >= p.nextLayerThreshold
-        : lastPrice <= p.nextLayerThreshold;
+    // DÖNGÜ: tek tick'te birden fazla katman eşiği aşılmış ise hepsini ekle
+    while (true) {
+      const hitThreshold =
+        p.side === 'BUY'
+          ? lastPrice >= p.nextLayerThreshold
+          : lastPrice <= p.nextLayerThreshold;
 
-    if (hitThreshold) {
+      if (!hitThreshold) break;
+
       const newLevel = p.layers.length + 1;
       // Fibonacci büyüme: her katman bir öncekinden growthMultiplier katı büyük
       const lastNotional = p.layers[p.layers.length - 1].notional;
@@ -133,6 +142,7 @@ export function updatePyramid(
         notional: newNotional,
       });
       p.peakLayers = Math.max(p.peakLayers, newLevel);
+      p._peakNotional = Math.max(p._peakNotional, totalNotional(p.layers));
       p.nextLayerThreshold = computeNextThreshold(
         lastPrice,
         p.side,
@@ -143,33 +153,56 @@ export function updatePyramid(
         p.side,
         config.layerRemovePct,
       );
+      p._lastGrowthTs = ts;
+      p.status = 'GROWING';
+      layersAdded++;
       events.push({ type: 'LAYER_ADDED', pyramid: p, level: newLevel });
+
+      // Sonsuz döngü koruması
+      if (newLevel > 50) break;
     }
   }
 
+  // PEAKED durumu: 5 saniyedir yeni katman eklenmemiş, halen GROWING durumunda
+  if (p.status === 'GROWING' && ts - p._lastGrowthTs > 5000) {
+    p.status = 'PEAKED';
+    events.push({ type: 'PEAKED', pyramid: p });
+  }
+
   // ─── Katman silme ────────────────────────────────────────
-  const lastLayer = p.layers[p.layers.length - 1];
-  if (lastLayer && p.layers.length > 1) {
+  // DÜZELTME: while döngüsü — tek ani tick'te birden fazla katman kırılırsa hepsini sil
+  let layersRemoved = 0;
+  while (p.layers.length > 1) {
+    const lastLayer = p.layers[p.layers.length - 1];
+    if (!lastLayer) break;
+
     const breached =
       p.side === 'BUY'
         ? lastPrice <= p.lastLayerInvalidatePrice
         : lastPrice >= p.lastLayerInvalidatePrice;
 
-    if (breached) {
-      const removed = p.layers.pop()!;
-      const newLast = p.layers[p.layers.length - 1];
-      // Eşikleri son kalan katmana göre güncelle
-      p.nextLayerThreshold = computeNextThreshold(
-        newLast.addPrice,
-        p.side,
-        config.layerAddPct,
-      );
-      p.lastLayerInvalidatePrice = computeLayerInvalidatePrice(
-        newLast.addPrice,
-        p.side,
-        config.layerRemovePct,
-      );
-      events.push({ type: 'LAYER_REMOVED', pyramid: p, level: removed.level });
+    if (!breached) break;
+
+    const removed = p.layers.pop()!;
+    const newLast = p.layers[p.layers.length - 1];
+    // Eşikleri son kalan katmana göre güncelle
+    p.nextLayerThreshold = computeNextThreshold(
+      newLast.addPrice,
+      p.side,
+      config.layerAddPct,
+    );
+    p.lastLayerInvalidatePrice = computeLayerInvalidatePrice(
+      newLast.addPrice,
+      p.side,
+      config.layerRemovePct,
+    );
+    layersRemoved++;
+    events.push({ type: 'LAYER_REMOVED', pyramid: p, level: removed.level });
+
+    // COLLAPSING durumuna geç
+    if (p.status !== 'COLLAPSING' && layersRemoved >= 1) {
+      p.status = 'COLLAPSING';
+      events.push({ type: 'COLLAPSING', pyramid: p, remainingLayers: p.layers.length });
     }
   }
 
@@ -198,4 +231,9 @@ export function updatePyramid(
 /** Anlık toplam hayali notional */
 export function pyramidNotional(p: PyramidState): number {
   return totalNotional(p.layers);
+}
+
+/** Piramidin yaşamı boyunca ulaştığı en yüksek notional */
+export function pyramidPeakNotional(p: PyramidState): number {
+  return p._peakNotional;
 }

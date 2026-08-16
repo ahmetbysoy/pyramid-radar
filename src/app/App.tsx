@@ -1,21 +1,35 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { fetchExchangeInfo, getMeta } from '../utils/exchangeInfo';
 import { formatPrice, formatPct, formatCompact } from '../utils/format';
 import { BinanceFuturesAdapter } from '../core/ws/BinanceFuturesAdapter';
 import { FlowEngine } from '../core/flow-engine';
-import { TIERS, type TierId } from '../core/tiers';
+import { TIERS } from '../core/tiers';
+import { PyramidVisual } from '../ui/components/PyramidVisual';
+import { usePyramidManager } from './usePyramidManager';
+import { useStore, SYMBOL } from '../store';
+import { setSoundEnabled, playTick } from '../utils/sound';
 import type { Trade, Depth, MarkPrice, WsStatus, SymbolMeta } from '../types';
 import '../styles/global.css';
-
-const SYMBOL = 'BTCUSDT';
 
 export function App() {
   const [status, setStatus] = useState<WsStatus>('connecting');
   const [meta, setMeta] = useState<SymbolMeta | null>(null);
   const [snap, setSnap] = useState<ReturnType<FlowEngine['compute']> | null>(null);
+  const [soundOn, setSoundOn] = useState(true);
+
   const engineRef = useRef(new FlowEngine());
-  const lastDepthRef = useRef<{ bids: [number, number][]; asks: [number, number][] } | null>(null);
+  const lastDepthRef = useRef<{ bids: [number, number][]; asks: [number, number][]; maxQty: number } | null>(null);
+  const priceRef = useRef(0);
+  const scoreRef = useRef(0);
+  const lastTradeRef = useRef<Trade | null>(null);
   const rafRef = useRef<number>(0);
+
+  // Store'dan piramit durumunu al
+  const activePyramids = useStore((s) => s.markets[SYMBOL]?.activePyramids ?? []);
+  const wreckedPyramids = useStore((s) => s.markets[SYMBOL]?.wreckedPyramids ?? []);
+  const setPrice = useStore((s) => s.setPrice);
+  const setLastTrade = useStore((s) => s.setLastTrade);
+  const setScore = useStore((s) => s.setScore);
 
   // Exchange info
   useEffect(() => {
@@ -26,15 +40,26 @@ export function App() {
     return () => { mounted = false; };
   }, []);
 
-  // WebSocket
+  // WebSocket + ana tick döngüsü
   useEffect(() => {
     const engine = engineRef.current;
     const adapter = new BinanceFuturesAdapter([SYMBOL], {
       onTrade: (t: Trade) => {
         engine.pushTrade(t.ts, t.price, t.qty, t.side);
+        priceRef.current = t.price;
+        lastTradeRef.current = t;
+        setPrice(SYMBOL, t.price);
+        setLastTrade(SYMBOL, t);
+        // Hafif tık sesi (sadece büyük tier'lar için)
+        const notional = t.price * t.qty;
+        const tierIdx = notional > 1_000_000 ? 5 : notional > 100_000 ? 4 : notional > 10_000 ? 3 : -1;
+        if (tierIdx >= 0) playTick(t.side, tierIdx);
       },
       onDepth: (d: Depth) => {
-        lastDepthRef.current = { bids: d.bids, asks: d.asks };
+        // Emir defteri barları için max qty hesapla (normalize)
+        const allQtys = [...d.bids, ...d.asks].map(([, q]) => q);
+        const maxQty = Math.max(0.0001, ...allQtys);
+        lastDepthRef.current = { bids: d.bids, asks: d.asks, maxQty };
       },
       onMark: (_m: MarkPrice) => {
         // aggTrade zaten fiyat veriyor, mark yedek
@@ -47,6 +72,17 @@ export function App() {
     const tick = () => {
       const s = engine.compute(Date.now());
       setSnap(s);
+      scoreRef.current = s.confidence * (s.signal.startsWith('BUY') ? 1 : s.signal.startsWith('SELL') ? -1 : 0);
+      // sign değerini confidence'a göre düzelt
+      const signedScore = (() => {
+        if (s.signal === 'STRONG_BUY') return s.confidence;
+        if (s.signal === 'BUY') return Math.max(20, s.confidence * 0.6);
+        if (s.signal === 'STRONG_SELL') return -s.confidence;
+        if (s.signal === 'SELL') return -Math.max(20, s.confidence * 0.6);
+        return 0;
+      })();
+      scoreRef.current = signedScore;
+      setScore(SYMBOL, signedScore);
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -55,7 +91,11 @@ export function App() {
       cancelAnimationFrame(rafRef.current);
       adapter.disconnect();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Piramit yöneticisi (store, spawn/update/wreck, ses/konfeti)
+  usePyramidManager(priceRef, scoreRef, lastTradeRef);
 
   const price = snap?.price ?? 0;
   const priceChange = snap?.priceChange1mPct ?? 0;
@@ -63,7 +103,6 @@ export function App() {
   const confidence = snap?.confidence ?? 0;
   const regime = snap?.regime ?? 'QUIET';
   const reasons = snap?.reasons ?? ['Bağlantı bekleniyor…'];
-  const tiers = snap?.tiers;
   const stats = snap?.stats;
 
   const signalColor =
@@ -76,13 +115,25 @@ export function App() {
   const regimeLabel: Record<string, { text: string; color: string; emoji: string }> = {
     ACCUMULATION:    { text: 'AKÜMÜLASYON (dip toplama)', color: '#34D399', emoji: '📥' },
     DISTRIBUTION:    { text: 'DİSTRİBÜSYON (tepe dağıtım)', color: '#F87171', emoji: '📤' },
-    SMART_FOLLOWS:   { text: 'Akıllı para fiyatı takip ediyor', color: '#22D3EE', emoji: '🎯' },
     SMART_FOLLOWS_PRICE: { text: 'Akıllı para fiyatı takip ediyor', color: '#22D3EE', emoji: '🎯' },
     RETAIL_DRIVEN:   { text: 'Perakende sürüklüyor (zayıf)', color: '#A78BFA', emoji: '🐟' },
     QUIET:           { text: 'Sessiz (hacim düşük)', color: '#7C8DB0', emoji: '🔇' },
   };
 
   const r = regimeLabel[regime] ?? regimeLabel.QUIET;
+  const lastWreck = wreckedPyramids[wreckedPyramids.length - 1];
+
+  const toggleSound = () => {
+    const next = !soundOn;
+    setSoundOn(next);
+    setSoundEnabled(next);
+  };
+  useEffect(() => { setSoundEnabled(soundOn); }, [soundOn]);
+
+  // Emir defteri görseli
+  const depthView = lastDepthRef.current;
+  const topAsks = useMemo(() => (depthView ? [...depthView.asks.slice(0, 8)].reverse() : []), [depthView?.bids.length, depthView?.asks.length, depthView?.maxQty]);
+  const topBids = useMemo(() => (depthView ? depthView.bids.slice(0, 8) : []), [depthView?.bids.length, depthView?.asks.length, depthView?.maxQty]);
 
   return (
     <div className="app app--full">
@@ -101,7 +152,14 @@ export function App() {
             {formatPct(priceChange)} · 1dk
           </div>
         </div>
-        <div className="hdr-right">
+        <div className="hdr-right" style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'flex-end' }}>
+          <button
+            className={`sound-btn ${soundOn ? 'on' : ''}`}
+            onClick={toggleSound}
+            title={soundOn ? 'Sesi kapat' : 'Sesi aç'}
+          >
+            {soundOn ? '🔊' : '🔇'}
+          </button>
           <span className="vol-tag">{stats ? formatCompact(stats.totalVolume) : '—'}</span>
         </div>
       </header>
@@ -125,20 +183,31 @@ export function App() {
           </div>
         </section>
 
+        {/* PİRAMİT GÖRSELİ */}
+        <section className="pyramid-panel">
+          <h3 className="section-title">PİRAMİT — para nerede birikiyor?</h3>
+          <PyramidVisual
+            pyramids={activePyramids}
+            wreckedCount={wreckedPyramids.length}
+            lastWreckReason={lastWreck?.wreckReason ?? null}
+            price={price}
+            meta={meta ?? undefined}
+          />
+        </section>
+
         {/* Tier katmanları */}
         <section className="tiers-panel">
           <h3 className="section-title">OYUNCU KATMANLARI — son 60 saniye</h3>
           <div className="tiers-grid">
             {[...TIERS].reverse().map((t) => {
-              const id = t.id as TierId;
-              const tm = tiers?.[id];
-              const total = tm ? tm.buyVol + tm.sellVol : 0;
-              const buyPct = total > 0 && tm ? (tm.buyVol / total) * 100 : 50;
-              const imb = tm?.imbalance ?? 0;
+              const tm = snap?.tiers?.[t.id as keyof typeof snap.tiers];
+              const total = tm ? (tm as unknown as { buyVol: number; sellVol: number }).buyVol + (tm as unknown as { buyVol: number; sellVol: number }).sellVol : 0;
+              const buyPct = total > 0 && tm ? ((tm as unknown as { buyVol: number; sellVol: number }).buyVol / total) * 100 : 50;
+              const imb = (tm as unknown as { imbalance?: number })?.imbalance ?? 0;
               const active = total > 0;
-              const isWhale = id === 'WHALE' || id === 'MEGA';
+              const isWhale = t.id === 'WHALE' || t.id === 'MEGA';
               return (
-                <div key={id} className={`tier-row ${active ? 'active' : ''} ${isWhale ? 'tier--whale' : ''}`}>
+                <div key={t.id} className={`tier-row ${active ? 'active' : ''} ${isWhale ? 'tier--whale' : ''}`}>
                   <div className="tier-label">
                     <span className="tier-emoji">{t.emoji}</span>
                     <span className="tier-name">{t.label}</span>
@@ -148,14 +217,8 @@ export function App() {
                   </div>
                   <div className="tier-bar-wrap">
                     <div className="tier-bar">
-                      <div
-                        className="tier-buy"
-                        style={{ width: `${buyPct}%` }}
-                      />
-                      <div
-                        className="tier-sell"
-                        style={{ width: `${100 - buyPct}%` }}
-                      />
+                      <div className="tier-buy" style={{ width: `${buyPct}%` }} />
+                      <div className="tier-sell" style={{ width: `${100 - buyPct}%` }} />
                     </div>
                     {active && Math.abs(imb) > 0.15 && (
                       <div className={`tier-arrow ${imb > 0 ? 'up' : 'down'}`}>
@@ -177,30 +240,40 @@ export function App() {
           </div>
         </section>
 
-        {/* Emir deteri */}
-        {lastDepthRef.current && (
+        {/* Emir defteri — normalize edilmiş bar genişliği */}
+        {depthView && (
           <section className="book-panel">
             <h3 className="section-title">EMİR DEFTERİ (20 seviye)</h3>
             <div className="book-rows">
-              {lastDepthRef.current.asks.slice(0, 8).reverse().map(([p, q], i) => (
-                <div key={'a' + i} className="book-row book-ask">
-                  <span className="book-pct">{formatPrice(p, meta ?? undefined)}</span>
-                  <span className="book-bar"><span className="book-bar-fill ask-fill" style={{ width: `${Math.min(100, q * 10)}%` }} /></span>
-                  <span className="book-qty">{q.toFixed(3)}</span>
-                </div>
-              ))}
+              {topAsks.map(([p, q], i) => {
+                const widthPct = Math.min(100, (q / depthView.maxQty) * 100);
+                return (
+                  <div key={'a' + i} className="book-row book-ask">
+                    <span className="book-pct">{formatPrice(p, meta ?? undefined)}</span>
+                    <span className="book-bar">
+                      <span className="book-bar-fill ask-fill" style={{ width: `${widthPct}%` }} />
+                    </span>
+                    <span className="book-qty">{meta ? q.toFixed(Math.min(6, meta.qtyDecimals)) : q.toFixed(3)}</span>
+                  </div>
+                );
+              })}
               <div className="book-spread">
                 <span className={priceChange >= 0 ? 'up' : 'down'}>
                   {formatPrice(price, meta ?? undefined)}
                 </span>
               </div>
-              {lastDepthRef.current.bids.slice(0, 8).map(([p, q], i) => (
-                <div key={'b' + i} className="book-row book-bid">
-                  <span className="book-pct">{formatPrice(p, meta ?? undefined)}</span>
-                  <span className="book-bar"><span className="book-bar-fill bid-fill" style={{ width: `${Math.min(100, q * 10)}%` }} /></span>
-                  <span className="book-qty">{q.toFixed(3)}</span>
-                </div>
-              ))}
+              {topBids.map(([p, q], i) => {
+                const widthPct = Math.min(100, (q / depthView.maxQty) * 100);
+                return (
+                  <div key={'b' + i} className="book-row book-bid">
+                    <span className="book-pct">{formatPrice(p, meta ?? undefined)}</span>
+                    <span className="book-bar">
+                      <span className="book-bar-fill bid-fill" style={{ width: `${widthPct}%` }} />
+                    </span>
+                    <span className="book-qty">{meta ? q.toFixed(Math.min(6, meta.qtyDecimals)) : q.toFixed(3)}</span>
+                  </div>
+                );
+              })}
             </div>
           </section>
         )}
@@ -218,6 +291,7 @@ export function App() {
               <span>İşlem/sn: <b>{(stats.tradeCount / 60).toFixed(1)}</b></span>
               <span>Balina: <b>{stats.whaleTradeCount}</b></span>
               <span>Mega: <b>{stats.megaTradeCount}</b></span>
+              {activePyramids.length > 0 && <span>Aktif piramit: <b>{activePyramids.length}</b></span>}
             </div>
           )}
         </section>

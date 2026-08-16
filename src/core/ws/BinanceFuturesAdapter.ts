@@ -13,6 +13,9 @@ import type { Depth, MarkPrice, Trade, WsStatus } from '../../types';
  *   - Market  (aggTrade, markPrice):  wss://fstream.binance.com/market/ws
  *   - Private (user data):             wss://fstream.binance.com/private/ws
  *
+ * 📌 Tek stream raw payload, çoklu stream wrapped {stream, data} formatı döner.
+ *    İki formatı da handle ediyoruz.
+ *
  * Kaynak: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
  */
 
@@ -26,6 +29,14 @@ interface Handlers {
   onStatus(s: WsStatus): void;
 }
 
+interface ParsedEnvelope {
+  stream: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: any;
+  sym: string;
+  ts: number;
+}
+
 export class BinanceFuturesAdapter {
   private symbols: string[];
   private publicWs: WebSocket | null = null;
@@ -37,6 +48,8 @@ export class BinanceFuturesAdapter {
   private publicRetry: ReturnType<typeof setTimeout> | null = null;
   private marketRetry: ReturnType<typeof setTimeout> | null = null;
   private backoffMs = 1000;
+  /** visibility değişince durdur/devam et */
+  private visibilityHandler: (() => void) | null = null;
 
   constructor(symbols: string[], handlers: Handlers) {
     this.symbols = symbols.map((s) => s.toLowerCase());
@@ -47,6 +60,29 @@ export class BinanceFuturesAdapter {
     this.destroyed = false;
     this._connectPublic();
     this._connectMarket();
+
+    // Sekme arka plana düşünce WS'yi kapat, geri dönünce yeniden aç (pil/trafik tasarrufu)
+    if (typeof document !== 'undefined' && !this.visibilityHandler) {
+      this.visibilityHandler = () => {
+        if (document.hidden) {
+          // Arka plan: sadece bağlantıyı kapat, reconnect'i temizle, durumu connecting yap
+          this._clearTimeouts();
+          this._close(this.publicWs);
+          this._close(this.marketWs);
+          this.publicWs = null;
+          this.marketWs = null;
+          this.publicReady = false;
+          this.marketReady = false;
+          this.handlers.onStatus('connecting');
+        } else {
+          // Ön plana dön: hemen yeniden bağlan
+          this.backoffMs = 1000;
+          this._connectPublic();
+          this._connectMarket();
+        }
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
   }
 
   disconnect(): void {
@@ -56,6 +92,10 @@ export class BinanceFuturesAdapter {
     this._close(this.marketWs);
     this.publicWs = null;
     this.marketWs = null;
+    if (this.visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
   }
 
   updateSymbols(symbols: string[]): void {
@@ -82,6 +122,7 @@ export class BinanceFuturesAdapter {
 
   private _connectPublic(): void {
     if (this.destroyed) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (this.symbols.length === 0) return;
 
     // Stream adı: <sym>@depth20@100ms
@@ -111,10 +152,11 @@ export class BinanceFuturesAdapter {
 
   private _connectMarket(): void {
     if (this.destroyed) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (this.symbols.length === 0) return;
 
     const streams = this.symbols
-      .map((s) => `${s}@aggTrade/${s}@markPrice@1s`)
+      .flatMap((s) => [`${s}@aggTrade`, `${s}@markPrice@1s`])
       .join('/');
     const url = `${MARKET_URL}/${streams}`;
     try {
@@ -147,6 +189,7 @@ export class BinanceFuturesAdapter {
 
   private _scheduleReconnect(which: 'public' | 'market'): void {
     if (this.destroyed) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
     this.handlers.onStatus('reconnecting');
     const delay = Math.min(this.backoffMs, 30_000);
     this.backoffMs *= 2;
@@ -164,68 +207,89 @@ export class BinanceFuturesAdapter {
     else this.marketRetry = t;
   }
 
-  private _handlePublicMessage(raw: string): void {
+  /**
+   * Gelen mesajı parçala: hem tek stream raw formatı hem de combined wrapped formatı destekler.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _unwrapMessage(raw: any, defaultStreamHint?: string): ParsedEnvelope | null {
+    // Binary ise parse etme
+    if (typeof raw !== 'string') return null;
+    let msg;
     try {
-      const msg = JSON.parse(raw) as { stream?: string; data?: unknown };
-      if (msg.stream && msg.data) {
-        // Combined stream: { stream, data }
-        const stream = msg.stream;
-        const data = msg.data as {
-          e?: string;
-          s?: string;
-          E?: number;
-          T?: number;
-          b?: string[][];
-          a?: string[][];
-        };
-        const sym = (data.s ?? stream.split('@')[0]).toUpperCase();
-        const ts = (data.E ?? Date.now());
-
-        if (data.b && data.a && stream.includes('depth')) {
-          const depth: Depth = {
-            ts,
-            symbol: sym,
-            bids: (data.b).map(([p, q]) => [parseFloat(p), parseFloat(q)] as [number, number]),
-            asks: (data.a).map(([p, q]) => [parseFloat(p), parseFloat(q)] as [number, number]),
-          };
-          this.handlers.onDepth(depth);
-        }
-      }
+      msg = JSON.parse(raw);
     } catch {
-      // JSON hatası
+      return null;
+    }
+
+    // Wrapped combined format: { stream, data }
+    if (msg && typeof msg === 'object' && 'stream' in msg && 'data' in msg && typeof msg.stream === 'string') {
+      const data = msg.data;
+      const stream = msg.stream as string;
+      const sym = (data?.s ?? stream.split('@')[0]).toUpperCase();
+      const ts = Number(data?.T ?? data?.E ?? Date.now());
+      return { stream, data, sym, ts };
+    }
+
+    // Tek stream raw payload: e field'ı event tipi, s sembol
+    if (msg && typeof msg === 'object' && 'e' in msg && 's' in msg) {
+      const data = msg;
+      const event = String(data.e ?? '');
+      let streamType: string;
+      switch (event) {
+        case 'depthUpdate': streamType = 'depth'; break;
+        case 'aggTrade': streamType = 'aggTrade'; break;
+        case 'markPriceUpdate': streamType = 'markPrice'; break;
+        default: streamType = defaultStreamHint ?? event;
+      }
+      // stream ismini combined formatta gelecekmiş gibi kur (alt kod aynı kalsın)
+      const symRaw = String(data.s ?? '').toLowerCase();
+      const stream = `${symRaw}@${streamType}`;
+      const ts = Number(data.T ?? data.E ?? Date.now());
+      return { stream, data, sym: String(data.s).toUpperCase(), ts };
+    }
+
+    return null;
+  }
+
+  private _handlePublicMessage(raw: string): void {
+    const env = this._unwrapMessage(raw, 'depth');
+    if (!env) return;
+
+    const { stream, data, sym, ts } = env;
+    if (data.b && data.a && stream.includes('depth')) {
+      const depth: Depth = {
+        ts,
+        symbol: sym,
+        bids: (data.b as string[][]).map(([p, q]) => [parseFloat(p), parseFloat(q)] as [number, number]),
+        asks: (data.a as string[][]).map(([p, q]) => [parseFloat(p), parseFloat(q)] as [number, number]),
+      };
+      this.handlers.onDepth(depth);
     }
   }
 
   private _handleMarketMessage(raw: string): void {
-    try {
-      const msg = JSON.parse(raw) as { stream?: string; data?: unknown };
-      if (!msg.stream || !msg.data) return;
-      const stream = msg.stream;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const data = msg.data as any;
-      const sym = (data.s ?? stream.split('@')[0]).toUpperCase();
-      const ts = (data.T ?? data.E ?? Date.now()) as number;
+    const env = this._unwrapMessage(raw);
+    if (!env) return;
 
-      if (stream.includes('aggTrade')) {
-        // m: true → buyer is market maker → aggressive side = SELL
-        const t: Trade = {
-          ts,
-          symbol: sym,
-          price: parseFloat(data.p),
-          qty: parseFloat(data.q),
-          side: data.m ? 'SELL' : 'BUY',
-        };
-        this.handlers.onTrade(t);
-      } else if (stream.includes('markPrice')) {
-        const m: MarkPrice = {
-          ts,
-          symbol: sym,
-          price: parseFloat(data.p),
-        };
-        this.handlers.onMark(m);
-      }
-    } catch {
-      // JSON hatası
+    const { stream, data, sym, ts } = env;
+
+    if (stream.includes('aggTrade')) {
+      // m: true → buyer is market maker → aggressive side = SELL
+      const t: Trade = {
+        ts,
+        symbol: sym,
+        price: parseFloat(data.p),
+        qty: parseFloat(data.q),
+        side: data.m ? 'SELL' : 'BUY',
+      };
+      this.handlers.onTrade(t);
+    } else if (stream.includes('markPrice')) {
+      const m: MarkPrice = {
+        ts,
+        symbol: sym,
+        price: parseFloat(data.p),
+      };
+      this.handlers.onMark(m);
     }
   }
 }

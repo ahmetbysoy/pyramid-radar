@@ -26,6 +26,10 @@ export interface PyramidState {
   lastLayerInvalidatePrice: number;
   status: 'GROWING' | 'PEAKED' | 'COLLAPSING' | 'WRECKED';
   peakLayers: number;
+  /** @internal son katman eklenme zamanı (PEAKED durumu için) */
+  _lastGrowthTs: number;
+  /** @internal piramidin yaşamı boyunca ulaştığı en yüksek toplam notional */
+  _peakNotional: number;
 }
 
 /** Piramit motoru ayarları */
