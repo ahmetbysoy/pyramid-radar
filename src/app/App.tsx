@@ -2,12 +2,13 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { fetchExchangeInfo, getMeta } from '../utils/exchangeInfo';
 import { formatPrice, formatPct, formatCompact } from '../utils/format';
 import { BinanceFuturesAdapter } from '../core/ws/BinanceFuturesAdapter';
-import { FlowEngine } from '../core/flow-engine';
-import { TIERS } from '../core/tiers';
-import { PyramidVisual } from '../ui/components/PyramidVisual';
+import { FlowEngine } from '../core/flow-engine-v2';
+import { PyramidVisual, type UIPyramid } from '../ui/components/PyramidVisual';
 import { usePyramidManager } from './usePyramidManager';
 import { useStore, SYMBOL } from '../store';
 import { setSoundEnabled, playTick, tone } from '../utils/sound';
+import { TIERS } from '../core/tiers';
+import { pyramidVWAP, pyramidPnLPct } from '../core/pyramid/real-flow-engine';
 import type { Trade, Depth, MarkPrice, WsStatus, SymbolMeta } from '../types';
 import '../styles/global.css';
 
@@ -20,11 +21,12 @@ export function App() {
   const engineRef = useRef(new FlowEngine());
   const lastDepthRef = useRef<{ bids: [number, number][]; asks: [number, number][]; maxQty: number } | null>(null);
   const priceRef = useRef(0);
-  const scoreRef = useRef(0);
+  const smartImbRef = useRef(0);
   const lastTradeRef = useRef<Trade | null>(null);
+  const pendingFillsRef = useRef<Array<{side:'BUY'|'SELL';price:number;qty:number;notional:number;tier:import('../core/tiers').TierId;ts:number}>>([]);
   const rafRef = useRef<number>(0);
 
-  // Store'dan piramit durumunu al
+  // Store
   const activePyramids = useStore((s) => s.markets[SYMBOL]?.activePyramids ?? []);
   const wreckedPyramids = useStore((s) => s.markets[SYMBOL]?.wreckedPyramids ?? []);
   const setPrice = useStore((s) => s.setPrice);
@@ -40,7 +42,7 @@ export function App() {
     return () => { mounted = false; };
   }, []);
 
-  // WebSocket + ana tick döngüsü
+  // WS + ana tick döngüsü
   useEffect(() => {
     const engine = engineRef.current;
     const adapter = new BinanceFuturesAdapter([SYMBOL], {
@@ -50,29 +52,40 @@ export function App() {
         lastTradeRef.current = t;
         setPrice(SYMBOL, t.price);
         setLastTrade(SYMBOL, t);
-        // Hafif tık sesi (sadece büyük tier'lar için)
         const notional = t.price * t.qty;
-        const tierIdx = notional > 1_000_000 ? 5 : notional > 100_000 ? 4 : notional > 10_000 ? 3 : -1;
-        if (tierIdx >= 0) playTick(t.side, tierIdx);
+        // Sadece akıllı para seviyesi üstündekiler için tık sesi
+        if (notional > 10_000) {
+          const tierIdx = notional > 1_000_000 ? 5 : notional > 100_000 ? 4 : 3;
+          playTick(t.side, tierIdx);
+        }
       },
       onDepth: (d: Depth) => {
-        // Emir defteri barları için max qty hesapla (normalize)
         const allQtys = [...d.bids, ...d.asks].map(([, q]) => q);
         const maxQty = Math.max(0.0001, ...allQtys);
         lastDepthRef.current = { bids: d.bids, asks: d.asks, maxQty };
       },
-      onMark: (_m: MarkPrice) => {
-        // aggTrade zaten fiyat veriyor, mark yedek
-      },
+      onMark: (_m: MarkPrice) => { /* yedek */ },
       onStatus: (s: WsStatus) => setStatus(s),
     });
     adapter.connect();
 
     // 10 Hz render döngüsü
-    let lastRafScore = 0;
+    let lastStoreScore = 0;
+    let lastDrainTs = 0;
     const tick = () => {
       const s = engine.compute(Date.now());
       setSnap(s);
+      smartImbRef.current = s.smartImbalance;
+
+      // Smart-money dolgularını piramit yöneticisine her tick ilet (100ms'de bir)
+      const now = Date.now();
+      if (now - lastDrainTs > 100) {
+        const fills = engine.drainFills();
+        for (const f of fills) pendingFillsRef.current.push(f);
+        lastDrainTs = now;
+      }
+
+      // signed skor (UI sinyalinden)
       const signedScore = (() => {
         if (s.signal === 'STRONG_BUY') return s.confidence;
         if (s.signal === 'BUY') return Math.max(20, s.confidence * 0.6);
@@ -80,11 +93,9 @@ export function App() {
         if (s.signal === 'SELL') return -Math.max(20, s.confidence * 0.6);
         return 0;
       })();
-      scoreRef.current = signedScore;
-      // sadece skor anlamlı değiştiyse store'a yaz (gereksiz re-render önle)
-      if (Math.abs(signedScore - lastRafScore) > 5) {
+      if (Math.abs(signedScore - lastStoreScore) > 5) {
         setScore(SYMBOL, signedScore);
-        lastRafScore = signedScore;
+        lastStoreScore = signedScore;
       }
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -97,8 +108,8 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Piramit yöneticisi (store, spawn/update/wreck, ses/konfeti)
-  usePyramidManager(priceRef, scoreRef, lastTradeRef);
+  // Piramit yöneticisi (yeni v2: gerçek dolgular + VWAP)
+  usePyramidManager(priceRef, smartImbRef, lastTradeRef, pendingFillsRef);
 
   const price = snap?.price ?? 0;
   const priceChange = snap?.priceChange1mPct ?? 0;
@@ -107,6 +118,7 @@ export function App() {
   const regime = snap?.regime ?? 'QUIET';
   const reasons = snap?.reasons ?? ['Bağlantı bekleniyor…'];
   const stats = snap?.stats;
+  const thresholds = snap?.thresholds;
 
   const signalColor =
     signal === 'STRONG_BUY' ? '#34D399'
@@ -133,12 +145,9 @@ export function App() {
   }, [soundOn]);
   useEffect(() => { setSoundEnabled(soundOn); }, [soundOn]);
 
-  // İlk kullanıcı hareketinde ses context'ini unlock et (iOS Safari gerektirir)
+  // iOS ses unlock
   useEffect(() => {
-    const unlock = () => {
-      // Sessiz bir tık ile context'i aktif et (duyulmayacak kadar düşük ses)
-      tone(800, 1, 'sine', 0.001);
-    };
+    const unlock = () => tone(800, 1, 'sine', 0.001);
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
     window.addEventListener('touchstart', unlock, { once: true });
@@ -149,12 +158,9 @@ export function App() {
     };
   }, []);
 
-  // Emir defteri görseli
-  const depthView = lastDepthRef.current;
+  // Order book (150ms throttle)
   const depthVersion = useRef(0);
   const [depthTick, setDepthTick] = useState(0);
-
-  // her ~100ms'de bir order book render et (10Hz çok hızlı, 100ms daha akıcı + daha az render)
   useEffect(() => {
     const id = setInterval(() => {
       depthVersion.current++;
@@ -164,12 +170,39 @@ export function App() {
   }, []);
   void depthTick;
 
+  const depthView = lastDepthRef.current;
   const topAsks = useMemo(() => (depthView ? [...depthView.asks.slice(0, 8)].reverse() : []), [depthView?.maxQty, depthTick]);
   const topBids = useMemo(() => (depthView ? depthView.bids.slice(0, 8) : []), [depthView?.maxQty, depthTick]);
 
+  // UI için gerçek piramit dönüşümü
+  const uiPyramids: UIPyramid[] = useMemo(() => {
+    return activePyramids.map((raw) => {
+      // RealPyramid ile aynı shape
+      const p = raw as unknown as import('../core/pyramid/real-flow-engine').RealPyramid;
+      return {
+        id: p.id,
+        side: p.side,
+        entryPrice: p.entryPrice,
+        layers: p.layers.map((l) => ({
+          level: l.level,
+          dominantTier: l.dominantTier,
+          anchorPrice: l.anchorPrice,
+          vwap: l.vwap,
+          notional: l.notional,
+          invalidatePrice: l.invalidatePrice,
+        })),
+        totalNotional: p.totalNotional,
+        vwap: pyramidVWAP(p),
+        pnlPct: pyramidPnLPct(p, price),
+        status: p.status,
+        peakLayers: p.peakLayers,
+        peakNotional: p.peakNotional,
+      };
+    });
+  }, [activePyramids, price]);
+
   return (
     <div className="app app--full">
-      {/* Header */}
       <header className="hdr">
         <div className="hdr-left">
           <span className={`status-dot ${status}`} />
@@ -184,12 +217,8 @@ export function App() {
             {formatPct(priceChange)} · 1dk
           </div>
         </div>
-        <div className="hdr-right" style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'flex-end' }}>
-          <button
-            className={`sound-btn ${soundOn ? 'on' : ''}`}
-            onClick={toggleSound}
-            title={soundOn ? 'Sesi kapat' : 'Sesi aç'}
-          >
+        <div className="hdr-right">
+          <button className={`sound-btn ${soundOn ? 'on' : ''}`} onClick={toggleSound} title={soundOn ? 'Sesi kapat' : 'Sesi aç'}>
             {soundOn ? '🔊' : '🔇'}
           </button>
           <span className="vol-tag">{stats ? formatCompact(stats.totalVolume) : '—'}</span>
@@ -197,7 +226,7 @@ export function App() {
       </header>
 
       <main className="main-panel">
-        {/* Sinyal paneli */}
+        {/* SİNYAL */}
         <section className="signal-panel" style={{ borderColor: signalColor, boxShadow: `0 0 40px ${signalColor}22` }}>
           <div className="signal-header">
             <span className="signal-label">SİNYAL</span>
@@ -215,36 +244,43 @@ export function App() {
           </div>
         </section>
 
-        {/* PİRAMİT GÖRSELİ */}
+        {/* PİRAMİT — GERÇEK PARANIN NEREDE BİRİKTİĞİ */}
         <section className="pyramid-panel">
-          <h3 className="section-title">PİRAMİT — para nerede birikiyor?</h3>
+          <h3 className="section-title">PİRAMİT — BALİNA VWAP HARİTASI</h3>
           <PyramidVisual
-            pyramids={activePyramids}
+            pyramids={uiPyramids}
             wreckedCount={wreckedPyramids.length}
             lastWreckReason={lastWreck?.wreckReason ?? null}
             price={price}
+            thresholds={thresholds}
             meta={meta ?? undefined}
           />
         </section>
 
-        {/* Tier katmanları */}
+        {/* TİER KATMANLARI */}
         <section className="tiers-panel">
           <h3 className="section-title">OYUNCU KATMANLARI — son 60 saniye</h3>
           <div className="tiers-grid">
             {[...TIERS].reverse().map((t) => {
-              const tm = snap?.tiers?.[t.id as keyof typeof snap.tiers];
-              const total = tm ? (tm as unknown as { buyVol: number; sellVol: number }).buyVol + (tm as unknown as { buyVol: number; sellVol: number }).sellVol : 0;
-              const buyPct = total > 0 && tm ? ((tm as unknown as { buyVol: number; sellVol: number }).buyVol / total) * 100 : 50;
-              const imb = (tm as unknown as { imbalance?: number })?.imbalance ?? 0;
+              const tm = snap?.tiers?.[t.id];
+              const total = tm ? tm.buyVol + tm.sellVol : 0;
+              const buyPct = total > 0 && tm ? (tm.buyVol / total) * 100 : 50;
+              const imb = tm?.imbalance ?? 0;
               const active = total > 0;
-              const isWhale = t.id === 'WHALE' || t.id === 'MEGA';
+              const isWhale = t.id === 'WHALE' || t.id === 'MEGA' || t.id === 'LARGE';
+              const th = thresholds;
+              const tierMin =
+                t.id === 'MEGA' ? (th?.MEGA ?? 1_000_000)
+                : t.id === 'WHALE' ? (th?.WHALE ?? 100_000)
+                : t.id === 'LARGE' ? (th?.LARGE ?? 10_000)
+                : t.minNotional;
               return (
                 <div key={t.id} className={`tier-row ${active ? 'active' : ''} ${isWhale ? 'tier--whale' : ''}`}>
                   <div className="tier-label">
                     <span className="tier-emoji">{t.emoji}</span>
                     <span className="tier-name">{t.label}</span>
                     <span className="tier-range">
-                      {t.id === 'MEGA' ? '>1M$' : t.id === 'MICRO' ? '<100$' : `${formatCompact(t.minNotional)}+`}
+                      {t.id === 'MICRO' ? '<' + formatCompact(th?.LARGE ? 0 : 100) : formatCompact(tierMin) + '+'}
                     </span>
                   </div>
                   <div className="tier-bar-wrap">
@@ -278,7 +314,7 @@ export function App() {
           </div>
         </section>
 
-        {/* Emir defteri — normalize edilmiş bar genişliği */}
+        {/* EMİR DEFTERİ */}
         {depthView && (
           <section className="book-panel">
             <h3 className="section-title">EMİR DEFTERİ (20 seviye)</h3>
@@ -316,7 +352,7 @@ export function App() {
           </section>
         )}
 
-        {/* Neden? paneli */}
+        {/* NEDEN? */}
         <section className="reasons-panel">
           <h3 className="section-title">NEDEN?</h3>
           <ul className="reasons-list">
@@ -329,14 +365,19 @@ export function App() {
               <span>İşlem/sn: <b>{(stats.tradeCount / 60).toFixed(1)}</b></span>
               <span>Balina: <b>{stats.whaleTradeCount}</b></span>
               <span>Mega: <b>{stats.megaTradeCount}</b></span>
-              {activePyramids.length > 0 && <span>Aktif piramit: <b>{activePyramids.length}</b></span>}
+              {activePyramids.length > 0 && <span>Piramit: <b>{activePyramids.length}</b></span>}
             </div>
           )}
+          <div className="stats-row" style={{ borderTop: 'none', paddingTop: 0, marginTop: 6 }}>
+            <small style={{ color: 'var(--muted)', fontFamily: 'var(--font-mono)', fontSize: '0.65rem' }}>
+              💡 Her katmandaki <b>VWAP</b> = balinaların o seviyedeki GERÇEK ortalama maliyeti. Fiyat alt VWAP'ı kırarsa stop.
+            </small>
+          </div>
         </section>
       </main>
 
       <footer className="ftr">
-        ⚠️ EĞİTİM AMAÇLIDIR · YATIRIM TAVSİYESİ DEĞİLDİR · Canlı Binance Futures verisi
+        ⚠️ EĞİTİM AMAÇLIDIR · YATIRIM TAVSİYESİ DEĞİLDİR · Canlı Binance Futures · Adaptif tier'lar
       </footer>
     </div>
   );

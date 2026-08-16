@@ -1,8 +1,7 @@
 import { create } from 'zustand';
-import type { SymbolMeta, WsStatus, PyramidState, WreckedPyramid, Trade } from '../types';
-import { pyramidNotional, pyramidPeakNotional } from '../core/pyramid/engine';
+import type { SymbolMeta, WsStatus, WreckedPyramid, Trade } from '../types';
 
-// TEK COIN: BTC/USDT — şimdilik mimariyi sadeleştiriyoruz, sonra çoklu coin ekleriz.
+// TEK COIN: BTC/USDT
 export const SYMBOL = 'BTCUSDT';
 
 interface MarketEntry {
@@ -10,11 +9,11 @@ interface MarketEntry {
   priceDir: 'up' | 'down' | 'same';
   meta?: SymbolMeta;
   lastTrade?: Trade;
-  activePyramids: PyramidState[];
-  wreckedPyramids: WreckedPyramid[];
-  /** Anlık composite skoru (-100 → +100) */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  activePyramids: any[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  wreckedPyramids: any[];
   score: number;
-  /** Son güncelleme zamanı */
   lastUpdate: number;
 }
 
@@ -26,9 +25,12 @@ interface Store {
   setPrice(symbol: string, price: number): void;
   setLastTrade(symbol: string, t: Trade): void;
   setMeta(symbol: string, meta: SymbolMeta): void;
-  addPyramid(symbol: string, p: PyramidState): void;
-  updatePyramid(symbol: string, p: PyramidState): void;
-  wreckPyramid(symbol: string, p: PyramidState, reason: 'REVERSAL' | 'TIMEOUT'): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  addPyramid(symbol: string, p: any): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  updatePyramid(symbol: string, p: any): void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  wreckPyramid(symbol: string, p: any, reason: 'REVERSAL' | 'TIMEOUT'): void;
   setScore(symbol: string, score: number): void;
 }
 
@@ -61,7 +63,7 @@ export const useStore = create<Store>((set) => ({
     set((st) => ({
       markets: {
         ...st.markets,
-        [symbol]: { ...st.markets[symbol] ?? emptyMarket(), meta },
+        [symbol]: { ...(st.markets[symbol] ?? emptyMarket()), meta },
       },
     })),
 
@@ -114,8 +116,7 @@ export const useStore = create<Store>((set) => ({
   wreckPyramid: (symbol, p, reason) =>
     set((st) => {
       const m = st.markets[symbol] ?? emptyMarket();
-      const totalNotional = pyramidNotional(p);
-      const peak = pyramidPeakNotional(p); // DÜZELTME: kendi ömür zirvesi
+      const totalNotional = p.totalNotional ?? 0;
       const wrecked: WreckedPyramid = {
         id: p.id,
         symbol: p.symbol,
@@ -123,15 +124,15 @@ export const useStore = create<Store>((set) => ({
         entryPrice: p.entryPrice,
         entryTs: p.entryTs,
         layers: p.layers,
-        baseSize: p.baseSize,
+        baseSize: p.baseSize ?? 0,
         totalNotional,
-        peakNotional: peak,
+        peakNotional: p.peakNotional ?? totalNotional,
         status: 'WRECKED' as const,
         wreckedAt: Date.now(),
         wreckReason: reason,
-        maxLayers: p.peakLayers,
+        maxLayers: p.peakLayers ?? p.layers?.length ?? 1,
         lifetimeMs: Date.now() - p.entryTs,
-        currentPnLPct: 0, // avgEntry(p) baz alınır ama zaten yıkıldı
+        currentPnLPct: 0,
         maxPnLPct: 0,
       };
       return {
@@ -140,7 +141,7 @@ export const useStore = create<Store>((set) => ({
           [symbol]: {
             ...m,
             activePyramids: m.activePyramids.filter((x) => x.id !== p.id),
-            wreckedPyramids: [...m.wreckedPyramids, wrecked].slice(-50), // son 50 ölü piramit
+            wreckedPyramids: [...m.wreckedPyramids, wrecked].slice(-50),
             lastUpdate: Date.now(),
           },
         },
